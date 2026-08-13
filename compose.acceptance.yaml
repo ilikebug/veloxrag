@@ -1,0 +1,19 @@
+services:
+  postgres:
+    ports: !reset []
+
+  qdrant:
+    ports: !reset []
+
+  redis:
+    ports: !reset []
+
+  minio:
+    ports: !reset []
+
+  api:
+    ports: !override
+      - target: 8000
+        published: "0"
+        protocol: tcp
+        host_ip: 127.0.0.1

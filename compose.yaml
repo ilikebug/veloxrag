@@ -1,0 +1,457 @@
+name: veloxrag
+
+# Published so that downloading this file is the whole install. Override
+# VELOX_IMAGE to use your own namespace, and add compose.build.yaml to build from
+# a source tree instead of pulling.
+x-rag-image: &rag-image
+  image: ${VELOX_IMAGE:-docker.io/ilikebug/veloxrag}:${VELOX_IMAGE_TAG:-latest}
+
+# Every host port is overridable, because all of these defaults are ports a
+# developer machine commonly already has taken. They bind the host side only —
+# the containers reach each other by service name on the Docker network, so
+# changing one never has to be matched anywhere else in this file. Overriding
+# RAG_API_HOST_PORT does mean an MCP client needs RAG_MCP_BASE_URL to match,
+# since its default is http://127.0.0.1:8000.
+
+x-api-environment: &api-environment
+  RAG_ENVIRONMENT: ${RAG_ENVIRONMENT:-local}
+  RAG_API_HOST: ${RAG_API_HOST:-0.0.0.0}
+  RAG_API_PORT: ${RAG_API_PORT:-8000}
+  RAG_DATABASE_URL: ${RAG_DATABASE_URL:-postgresql+psycopg://rag:change-me-local@postgres:5432/rag}
+  RAG_REDIS_URL: ${RAG_REDIS_URL:-redis://redis:6379/0}
+  RAG_QDRANT_URL: ${RAG_QDRANT_URL:-http://qdrant:6333}
+  RAG_QDRANT_CONNECT_TIMEOUT_SECONDS: ${RAG_QDRANT_CONNECT_TIMEOUT_SECONDS:-5.0}
+  RAG_QDRANT_REQUEST_TIMEOUT_SECONDS: ${RAG_QDRANT_REQUEST_TIMEOUT_SECONDS:-30.0}
+  RAG_MINIO_URL: ${RAG_MINIO_URL:-http://minio:9000}
+  RAG_MINIO_ACCESS_KEY: ${RAG_MINIO_ACCESS_KEY:-rag-dev}
+  RAG_MINIO_SECRET_KEY: ${RAG_MINIO_SECRET_KEY:-change-me-local}
+  RAG_MINIO_BUCKET: ${RAG_MINIO_BUCKET:-rag-documents}
+  RAG_INGESTION_NOTIFY_TIMEOUT_SECONDS: ${RAG_INGESTION_NOTIFY_TIMEOUT_SECONDS:-0.25}
+  RAG_MAX_UPLOAD_BYTES: ${RAG_MAX_UPLOAD_BYTES:-52428800}
+  RAG_UPLOAD_BUFFER_BYTES: ${RAG_UPLOAD_BUFFER_BYTES:-1048576}
+  RAG_MINIO_MULTIPART_PART_SIZE_BYTES: ${RAG_MINIO_MULTIPART_PART_SIZE_BYTES:-5242880}
+  RAG_MINIO_OPERATION_TIMEOUT_SECONDS: ${RAG_MINIO_OPERATION_TIMEOUT_SECONDS:-300.0}
+  RAG_WORKER_POLL_INTERVAL_SECONDS: ${RAG_WORKER_POLL_INTERVAL_SECONDS:-1.0}
+  RAG_WORKER_LEASE_SECONDS: ${RAG_WORKER_LEASE_SECONDS:-60.0}
+  RAG_WORKER_HEARTBEAT_SECONDS: ${RAG_WORKER_HEARTBEAT_SECONDS:-15.0}
+  RAG_WORKER_MAX_ATTEMPTS: ${RAG_WORKER_MAX_ATTEMPTS:-5}
+  RAG_WORKER_RETRY_INITIAL_SECONDS: ${RAG_WORKER_RETRY_INITIAL_SECONDS:-5.0}
+  RAG_WORKER_RETRY_MAX_SECONDS: ${RAG_WORKER_RETRY_MAX_SECONDS:-300.0}
+  RAG_ORPHAN_OBJECT_GRACE_SECONDS: ${RAG_ORPHAN_OBJECT_GRACE_SECONDS:-86400}
+  RAG_READINESS_TIMEOUT_SECONDS: ${RAG_READINESS_TIMEOUT_SECONDS:-2.0}
+  RAG_SHUTDOWN_TIMEOUT_SECONDS: ${RAG_SHUTDOWN_TIMEOUT_SECONDS:-2.0}
+  RAG_PROVIDER_CREDENTIAL_KEYRING: '${RAG_PROVIDER_CREDENTIAL_KEYRING:-{"local-v1":"ZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGQ="}}'
+  RAG_PROVIDER_CREDENTIAL_ACTIVE_KEY_VERSION: ${RAG_PROVIDER_CREDENTIAL_ACTIVE_KEY_VERSION:-local-v1}
+  # This file is the local single-user stack: downloading it and running
+  # `docker compose up` is meant to be the whole setup. The two switches below
+  # are what make that true, and the service refuses to start with either of them
+  # set when RAG_ENVIRONMENT=production, so they cannot follow a copied file into
+  # a deployment.
+  #
+  # Admits requests that carry no credential, attributing them to a provisioned
+  # local actor. An invalid token is still rejected. This is what lets an MCP
+  # client be configured with nothing but a command.
+  RAG_LOCAL_TRUSTED_AUTH: ${RAG_LOCAL_TRUSTED_AUTH:-true}
+  # The embedding container answers on the Docker network, which is a private
+  # address the provider policy refuses by default. Terminating TLS in front of it
+  # is not enough: the policy makes two separate checks and this is the one on the
+  # resolved IP, so no network arrangement avoids it. Loopback and private ranges
+  # are all this opens — cloud metadata, link-local, multicast and reserved ranges
+  # stay refused.
+  RAG_PROVIDER_ALLOW_PRIVATE_TARGETS: ${RAG_PROVIDER_ALLOW_PRIVATE_TARGETS:-true}
+  RAG_PROVIDER_CA_BUNDLE: ${RAG_PROVIDER_CA_BUNDLE:-/run/rag/embedding-ca/ca.pem}
+  RAG_ADMIN_KEY_HMAC_SECRET: ${RAG_ADMIN_KEY_HMAC_SECRET:-local-dev-admin-hmac-secret-not-for-production-01}
+  RAG_AGENT_KEY_HMAC_SECRET: ${RAG_AGENT_KEY_HMAC_SECRET:-local-dev-agent-hmac-secret-not-for-production-02}
+  RAG_DEFAULT_PAGE_SIZE: ${RAG_DEFAULT_PAGE_SIZE:-20}
+  RAG_MAX_PAGE_SIZE: ${RAG_MAX_PAGE_SIZE:-100}
+  RAG_MAX_API_KEY_REQUESTS_PER_MINUTE: ${RAG_MAX_API_KEY_REQUESTS_PER_MINUTE:-10000}
+  RAG_MAX_API_KEY_CONCURRENCY: ${RAG_MAX_API_KEY_CONCURRENCY:-1000}
+
+x-rag-runtime: &rag-runtime
+  <<: *rag-image
+  init: true
+  restart: unless-stopped
+  volumes:
+    - provider_ca:/run/rag/provider-ca:ro
+    - embedding_ca:/run/rag/embedding-ca:ro
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    # RAG_PROVIDER_CA_BUNDLE defaults into the embedding_ca volume and both
+    # processes load it once at startup, so the CA has to exist before they run.
+    # A full `up` happened to satisfy this by ordering luck; starting a subset
+    # (`up -d api worker`) did not, and the failure is silent — the worker exits
+    # non-zero with nothing in its logs.
+    embedding-tls-init:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+    qdrant:
+      condition: service_started
+    minio-init:
+      condition: service_completed_successfully
+    provider-tls-init:
+      condition: service_completed_successfully
+      required: false
+
+services:
+  postgres:
+    image: postgres:18.4-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-local}
+    ports:
+      - "127.0.0.1:${RAG_POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.3
+    ports:
+      - "127.0.0.1:${RAG_QDRANT_HOST_PORT:-6333}:6333"
+      - "127.0.0.1:${RAG_QDRANT_GRPC_HOST_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  redis:
+    image: redis:8.8.0-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${RAG_REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-rag-dev}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-local}
+    ports:
+      - "127.0.0.1:${RAG_MINIO_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${RAG_MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:9000/minio/health/ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    <<: *rag-image
+    command: ["velox-minio-init"]
+    environment:
+      RAG_MINIO_URL: ${RAG_MINIO_URL:-http://minio:9000}
+      RAG_MINIO_ACCESS_KEY: ${RAG_MINIO_ACCESS_KEY:-rag-dev}
+      RAG_MINIO_SECRET_KEY: ${RAG_MINIO_SECRET_KEY:-change-me-local}
+      RAG_MINIO_BUCKET: ${RAG_MINIO_BUCKET:-rag-documents}
+      RAG_MINIO_INIT_MAX_ATTEMPTS: ${RAG_MINIO_INIT_MAX_ATTEMPTS:-30}
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+  migrate:
+    <<: *rag-image
+    command: ["alembic", "upgrade", "head"]
+    environment: *api-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # Turns a running stack into a usable one: provider config, probed model
+  # profile, knowledge base, filter schema and initial generation. Idempotent, so
+  # it is safe on every `up`. Drives the same HTTP API a human would, so there is
+  # no second definition of what a valid setup looks like.
+  bootstrap:
+    <<: *rag-image
+    command: ["velox-bootstrap"]
+    environment:
+      RAG_BOOTSTRAP_BASE_URL: ${RAG_BOOTSTRAP_BASE_URL:-http://api:8000}
+      RAG_BOOTSTRAP_EMBEDDING_URL: ${RAG_BOOTSTRAP_EMBEDDING_URL:-https://embedding/v1}
+      RAG_BOOTSTRAP_RERANK_URL: ${RAG_BOOTSTRAP_RERANK_URL:-}
+      RAG_BOOTSTRAP_KNOWLEDGE_BASE: ${RAG_BOOTSTRAP_KNOWLEDGE_BASE:-local-memory}
+    depends_on:
+      api:
+        condition: service_healthy
+      embedding:
+        condition: service_healthy
+    restart: "no"
+
+  # The embedding profile runs a real embedding model locally so no corpus text
+  # leaves the machine. See docs/local-embedding.md for the throughput numbers
+  # that decide when to use it and when to point at an external endpoint.
+  embedding-tls-init:
+    <<: *rag-image
+    user: "0:0"
+    command:
+      [
+        "velox-provider-stub-tls",
+        # A separate CA directory from provider-stub's on purpose: both
+        # generators write `ca.pem`, so sharing one volume would leave whichever
+        # profile started first with a cert signed by a CA that is no longer
+        # trusted.
+        "--ca-output-directory",
+        "/run/rag/embedding-ca",
+        "--server-output-directory",
+        "/run/rag/embedding-server-tls",
+        "--hostname",
+        "embedding",
+        "--owner-uid",
+        "0",
+        "--owner-gid",
+        "0",
+        # api and worker load the CA once at process start, so regenerating it
+        # on every `up` leaves them trusting a CA the proxy no longer presents.
+        # The failure is opaque: the embedding call fails PROVIDER_UNAVAILABLE
+        # with retryable set, and neither the proxy nor the model logs anything,
+        # because the client rejects the certificate before sending a request.
+        "--reuse-existing",
+      ]
+    volumes:
+      - embedding_ca:/run/rag/embedding-ca
+      - embedding_server_tls:/run/rag/embedding-server-tls
+    restart: "no"
+
+  embedding-model:
+    # text-embeddings-inference publishes no multi-architecture tag, so this
+    # default has to name one architecture and it is the arm64 one. On x86_64
+    # run `RAG_EMBEDDING_IMAGE_TAG=cpu-latest docker compose up -d` — without it
+    # the container fails to start with an exec format error, which does not
+    # mention the tag. `make start` picks the tag from `uname -m` instead.
+    image: ghcr.io/huggingface/text-embeddings-inference:${RAG_EMBEDDING_IMAGE_TAG:-cpu-arm64-latest}
+    command:
+      [
+        "--model-id",
+        "${RAG_EMBEDDING_MODEL_ID:-BAAI/bge-m3}",
+        "--auto-truncate",
+        # Left at TEI's default these warm up against the model's full
+        # 8192-token window and the container is OOM-killed on a 16 GB host.
+        "--max-batch-tokens",
+        "${RAG_EMBEDDING_MAX_BATCH_TOKENS:-4096}",
+        "--max-batch-requests",
+        "4",
+        # Kept in step with max-batch-tokens rather than set independently: a
+        # 600-codepoint chunk of technical prose runs past 256 tokens, so a
+        # client batch of 16 overruns 4096 and comes back 429. 8 is measured to
+        # fit. Model profiles should use a batch_size no larger than this.
+        "--max-client-batch-size",
+        "${RAG_EMBEDDING_MAX_CLIENT_BATCH_SIZE:-8}",
+        # Queue depth, not a memory bound — memory is governed by the two limits
+        # above. TEI rejects with 429 rather than blocking once the permits are
+        # gone, and an ingest worker treats that as a provider failure and burns
+        # its retries, so this has to be wide enough to absorb a batch import.
+        "--max-concurrent-requests",
+        "${RAG_EMBEDDING_MAX_CONCURRENT_REQUESTS:-256}",
+      ]
+    volumes:
+      - embedding_model_cache:/data
+    restart: unless-stopped
+
+  embedding:
+    image: nginx:1.27-alpine
+    volumes:
+      - embedding_server_tls:/run/rag/embedding-server-tls:ro
+    # Inlined rather than bind-mounted from the source tree, because downloading
+    # this file is the whole install and a relative bind mount would silently
+    # become an empty directory on a machine that has no checkout.
+    configs:
+      - source: embedding_proxy
+        target: /etc/nginx/nginx.conf
+    depends_on:
+      embedding-tls-init:
+        condition: service_completed_successfully
+      embedding-model:
+        condition: service_started
+    healthcheck:
+      # Probes through the proxy so readiness means "the model answers", not
+      # "nginx started". start_period covers the first-run model download.
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--no-check-certificate",
+          "--output-document=/dev/null",
+          "https://127.0.0.1/health",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 3600s
+    restart: unless-stopped
+
+  provider-tls-init:
+    <<: *rag-image
+    profiles: ["provider-stub"]
+    user: "0:0"
+    command:
+      [
+        "velox-provider-stub-tls",
+        "--ca-output-directory",
+        "/run/rag/provider-ca",
+        "--server-output-directory",
+        "/run/rag/provider-server-tls",
+        "--hostname",
+        "provider-stub",
+        "--owner-uid",
+        "10001",
+        "--owner-gid",
+        "10001",
+      ]
+    volumes:
+      - provider_ca:/run/rag/provider-ca
+      - provider_server_tls:/run/rag/provider-server-tls
+    restart: "no"
+
+  provider-stub:
+    <<: *rag-image
+    profiles: ["provider-stub"]
+    command:
+      [
+        "velox-provider-stub",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8443",
+        "--dimension",
+        "3",
+        "--max-batch-size",
+        "8",
+        "--allow-container-bind",
+        "--cert-file",
+        "/run/rag/provider-server-tls/cert.pem",
+        "--key-file",
+        "/run/rag/provider-server-tls/key.pem",
+      ]
+    environment:
+      RAG_ENVIRONMENT: local
+      RAG_PROVIDER_STUB_AUTHORIZATION_SHA256: ${RAG_PROVIDER_STUB_AUTHORIZATION_SHA256:-392a05ede7c64a03fc19d8af61f029e684eb00ac662d17716970e5c7d769dbf3}
+    volumes:
+      - provider_ca:/run/rag/provider-ca:ro
+      - provider_server_tls:/run/rag/provider-server-tls:ro
+    depends_on:
+      provider-tls-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import ssl,urllib.request; c=ssl.create_default_context(cafile='/run/rag/provider-ca/ca.pem'); urllib.request.urlopen('https://localhost:8443/health', context=c, timeout=2).read()",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    <<: *rag-runtime
+    command: ["uvicorn", "rag_service.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *api-environment
+    ports:
+      - "127.0.0.1:${RAG_API_HOST_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 5s
+
+  worker:
+    <<: *rag-runtime
+    command: ["velox-worker", "--health-file", "/tmp/velox-worker-health.json", "--max-concurrency", "${RAG_WORKER_MAX_CONCURRENCY:-4}"]
+    environment:
+      <<: *api-environment
+      RAG_WORKER_HEALTH_FILE: /tmp/velox-worker-health.json
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "velox-worker-health",
+          "--health-file",
+          "/tmp/velox-worker-health.json",
+          "--max-age-seconds",
+          "10",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 5s
+
+configs:
+  # TLS front for the local embedding server.
+  #
+  # The provider policy requires https (providers/network_policy.py), and no
+  # local inference server speaks it. Terminating TLS here keeps the local path
+  # on the same code route as a hosted provider instead of carving out an
+  # exception.
+  #
+  # WARNING for anyone editing the nginx config below: compose interpolates this
+  # content, and an nginx variable is the same syntax. A bare $remote_addr or
+  # ${host} is replaced with the empty string, silently and with no warning —
+  # verified, not theoretical. Write nginx variables as $$remote_addr; the
+  # container then receives a single $. Nothing here needs one today, which is
+  # the only reason this file has no escapes in it.
+  #
+  # Requires Docker Compose 2.23.1 or newer, which is where inline content
+  # landed. Older versions parse the file but mount nothing.
+  embedding_proxy:
+    content: |
+      events {}
+
+      http {
+        access_log off;
+
+        server {
+          listen 443 ssl;
+
+          ssl_certificate     /run/rag/embedding-server-tls/cert.pem;
+          ssl_certificate_key /run/rag/embedding-server-tls/key.pem;
+
+          # Embedding batches carry chunk text, not uploads, but the default 1m
+          # cap is tight enough that a large batch would fail rather than slow
+          # down.
+          client_max_body_size 32m;
+
+          location / {
+            proxy_pass http://embedding-model:80;
+            proxy_http_version 1.1;
+            # A cold model can take minutes to answer the first request on CPU.
+            proxy_read_timeout 900s;
+            proxy_send_timeout 900s;
+          }
+        }
+      }
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:
+  minio_data:
+  provider_ca:
+  provider_server_tls:
+  embedding_ca:
+  embedding_server_tls:
+  embedding_model_cache:

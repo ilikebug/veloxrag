@@ -1,0 +1,37 @@
+# Build the VeloxRAG image from this source tree instead of pulling it.
+#
+# compose.yaml ships a published image reference so that downloading that one
+# file is the whole install. Working on the code needs the opposite, and the two
+# cannot share a YAML anchor across files, so every service that runs the
+# VeloxRAG image repeats the build stanza here.
+#
+#   docker compose -f compose.yaml -f compose.build.yaml build api
+#   docker compose -f compose.yaml -f compose.build.yaml up -d
+#
+# `make start` and the test targets pass both files already.
+services:
+  api:
+    build: &velox-build
+      context: .
+    image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}
+  worker:
+    build: *velox-build
+    image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}
+  migrate:
+    build: *velox-build
+    image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}
+  minio-init:
+    build: *velox-build
+    image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}
+  bootstrap:
+    build: *velox-build
+    image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}
+  embedding-tls-init:
+    build: *velox-build
+    image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}
+  provider-tls-init:
+    build: *velox-build
+    image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}
+  provider-stub:
+    build: *velox-build
+    image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}

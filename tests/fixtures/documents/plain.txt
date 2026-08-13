@@ -1,0 +1,4 @@
+First paragraph has café and 你好.
+It continues with emoji 🚚.
+
+Second paragraph stays byte-for-byte.
