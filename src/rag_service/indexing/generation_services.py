@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rag_service.api.cursors import CursorPosition, decode_cursor, encode_cursor
 from rag_service.api.errors import BusinessError
 from rag_service.auth.policies import AdminPrincipal
+from rag_service.db.models.documents import Job
 from rag_service.db.models.knowledge_bases import (
     IndexGenerationCreationRequest,
     KnowledgeBase,
@@ -1187,12 +1188,13 @@ class GenerationService:
                 generation.safe_error_code = None
                 generation.safe_error_message = None
                 knowledge_base.mutation_revision = new_revision
+                mutation_id = uuid5(
+                    _REQUEST_NAMESPACE,
+                    f"mutation:{generation.id}:{new_revision}",
+                )
                 await repository.add_mutation(
                     KnowledgeBaseMutation(
-                        id=uuid5(
-                            _REQUEST_NAMESPACE,
-                            f"mutation:{generation.id}:{new_revision}",
-                        ),
+                        id=mutation_id,
                         knowledge_base_id=knowledge_base.id,
                         revision=new_revision,
                         mutation_type="index_config_changed",
@@ -1247,6 +1249,34 @@ class GenerationService:
                         now=now,
                     )
                     if enrolled:
+                        await repository.flush()
+                        # Queued here rather than left to the caller. A successor
+                        # that is active but empty answers every search with
+                        # nothing, and the caller has no way to tell that from a
+                        # knowledge base that genuinely holds nothing — so the
+                        # backfill has to be part of the swap, not a second step
+                        # someone has to know about.
+                        point_total = await repository.live_point_total(knowledge_base.id)
+                        session.add(
+                            Job(
+                                id=uuid4(),
+                                knowledge_base_id=knowledge_base.id,
+                                target_type="index_generation",
+                                target_id=generation.id,
+                                target_revision=new_revision,
+                                index_generation_id=generation.id,
+                                mutation_id=mutation_id,
+                                operation="rebuild_generation",
+                                stage="indexing",
+                                status="queued",
+                                progress_current=0,
+                                progress_total=point_total,
+                                attempt_count=0,
+                                max_attempts=5,
+                                lease_epoch=0,
+                                retryable=True,
+                            )
+                        )
                         await repository.flush()
                 generation.status = "active"
                 knowledge_base.pending_index_generation_id = None
