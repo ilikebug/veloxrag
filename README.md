@@ -24,6 +24,10 @@ What it needs first:
   Compose parses the file and mounts nothing, which surfaces as the nginx container failing to
   start. The installer will not install Docker for you — on macOS that is a choice between
   Docker Desktop and Colima that belongs to you.
+- **2 CPUs, 4 GiB of memory and about 4 GB of disk** for the Docker VM — the containers idle at
+  roughly 450 MiB in total, so the headroom is for the ingest and the corpus rather than the
+  services. [Resources it needs](#resources-it-needs) has the measured figures and where to set
+  the limits.
 - **Ollama on the host.** The embedding model runs on the host rather than in a container because
   that is the only place it reaches the GPU: Docker on macOS is a Linux VM with no Metal
   passthrough, measured at 3.10 chunks/s against 14.20 on the host, and the flat batch curve says
@@ -159,6 +163,79 @@ What each component owns, which is also the backup priority:
 
 Do not log any secret, token, authentication header, or raw response containing one, and keep
 credentials out of command line arguments, shell history and Git.
+
+## Resources it needs
+
+Measured on the running stack rather than estimated. Idle, the seven containers hold about
+450 MiB between them:
+
+| Container | Idle memory | What it does under load |
+| --- | --- | --- |
+| api | 137 MiB | CPU spikes to ~15% while accepting an upload |
+| worker | 124 MiB | one core to ~70% while chunking; memory flat |
+| minio | 77 MiB | — |
+| qdrant | 57 MiB | grows with the index, see below |
+| postgres | 48 MiB | — |
+| redis | 6 MiB | — |
+| embedding (nginx) | 2 MiB | proxy only; the model is on the host |
+
+Memory barely moves during ingestion because the expensive part — embedding — runs in Ollama on
+the host, not in a container. That is also why a machine that could not previously fit the
+containerized model can run this: the container side needs well under 1 GiB.
+
+Storage, measured against a small corpus and linear in the number of chunks:
+
+| What | Size |
+| --- | --- |
+| Images, all seven | 1.8 GB |
+| Ollama plus `bge-m3` (host, outside Docker) | about 1.5 GB |
+| Postgres, empty schema | 65 MiB |
+| Qdrant | about 30 KB per chunk at 1024 dimensions |
+| MinIO | roughly the size of the corpus, plus normalized text and chunk manifests |
+
+A rough total: 4 GB of disk covers the images, the model and a corpus of a few thousand chunks.
+The number that grows is Qdrant, and a cutover doubles it until the retired collection is removed
+by hand.
+
+### Setting the limits
+
+Nothing in `compose.yaml` caps CPU or memory, deliberately: the ceiling that matters is the one on
+the Linux VM your Docker runs in, and a per-container cap below it only turns a slow ingest into a
+killed one.
+
+On macOS the VM is where to set it. When Colima is installed but not running, `install.sh` starts
+it with 4 CPUs, 8 GiB and 60 GiB, overridable through `VELOX_VM_CPU`, `VELOX_VM_MEMORY` and
+`VELOX_VM_DISK`. A **running** VM it leaves alone, and so should you by this route:
+
+```bash
+colima stop && colima start --cpu 4 --memory 8 --disk 60
+```
+
+The stop matters. `colima start` does not resize a running instance, but `--save-config` defaults
+to true, so passing the flags to a live VM rewrites the config without applying it — the machine
+keeps its old size until the next restart silently adopts the new one. A Colima disk can also grow
+later but not shrink, so err large on that one.
+
+Docker Desktop has the same three under Settings → Resources. 2 CPUs and 4 GiB run the stack; 4
+CPUs and 8 GiB leave room for the host Ollama to use the GPU without competing for RAM. On Linux
+there is no VM and the containers use the host directly.
+
+**Give the disk more room than the corpus needs.** A full disk fails in two directions at once:
+Qdrant refuses writes with `No space left on device`, and — measured, not theorized — a Docker
+build in the same state fails without saying why, so the next thing you try appears broken for an
+unrelated reason. `docker system df` shows where it went; build cache and old images are usually
+most of it.
+
+If you do want a per-container cap, compose takes one:
+
+```yaml
+services:
+  worker:
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+```
 
 ## HTTP API
 

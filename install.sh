@@ -18,6 +18,10 @@ VELOX_HOME="${VELOX_HOME:-$HOME/.veloxrag}"
 VELOX_MODEL="${VELOX_MODEL:-bge-m3}"
 COMPOSE_URL="https://raw.githubusercontent.com/ilikebug/veloxrag/${VELOX_REF}/compose.yaml"
 API_PORT="${RAG_API_HOST_PORT:-8000}"
+# Only used when Colima is installed and not yet running; see below.
+VELOX_VM_CPU="${VELOX_VM_CPU:-4}"
+VELOX_VM_MEMORY="${VELOX_VM_MEMORY:-8}"
+VELOX_VM_DISK="${VELOX_VM_DISK:-60}"
 
 say() { printf '\033[1m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$1" >&2; }
@@ -42,6 +46,22 @@ if ! command -v docker >/dev/null 2>&1; then
   die "Docker is required. See https://docs.docker.com/engine/install/ then run this again."
 fi
 
+# Started only when nothing is running yet. Resizing a live VM is a different
+# matter: `colima start` does not change a running instance's resources, but
+# --save-config defaults to true, so passing --cpu/--memory to a running Colima
+# rewrites the config without applying it and silently changes what the machine
+# does at its next restart. That is the same class of fault as a setting the
+# service reads but compose never passes — config and reality disagreeing, with
+# nothing reporting it. So a running VM is left exactly as the user sized it.
+if ! docker info >/dev/null 2>&1; then
+  if command -v colima >/dev/null 2>&1 && ! colima status >/dev/null 2>&1; then
+    say "Starting Colima with ${VELOX_VM_CPU} CPUs, ${VELOX_VM_MEMORY} GiB of memory and ${VELOX_VM_DISK} GiB of disk"
+    say "Override with VELOX_VM_CPU / VELOX_VM_MEMORY / VELOX_VM_DISK; a Colima disk can grow later but not shrink"
+    colima start --cpu "$VELOX_VM_CPU" --memory "$VELOX_VM_MEMORY" --disk "$VELOX_VM_DISK" \
+      || die "colima start failed. Size it yourself and run this again."
+  fi
+fi
+
 if ! docker info >/dev/null 2>&1; then
   die "Docker is installed but not running. Start Docker Desktop, or run 'colima start', then run this again."
 fi
@@ -53,6 +73,34 @@ compose_version="$(docker compose version --short 2>/dev/null || echo 0)"
 if [ "$(printf '%s\n2.23.1\n' "$compose_version" | sort -V | head -1)" != "2.23.1" ]; then
   die "Docker Compose 2.23.1 or newer is required (found ${compose_version}); this file uses inline configs."
 fi
+
+# Warned about rather than fixed. Resizing the VM is a system-level decision, and
+# on macOS the runtime might be Docker Desktop, Colima, Rancher or OrbStack — and
+# for Colima specifically `colima start --cpu N` does not resize a running
+# instance, so "helpfully" applying it would mean stopping a VM that may be
+# running someone else's containers.
+docker_cpus="$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 0)"
+docker_mem_gib="$(docker info --format '{{.MemTotal}}' 2>/dev/null | awk '{printf "%d", $1/1073741824}')"
+if [ "${docker_cpus:-0}" -lt 2 ] 2>/dev/null; then
+  warn "Docker reports ${docker_cpus} CPU(s). Ingestion chunks on one core and will be slow."
+fi
+if [ "${docker_mem_gib:-0}" -lt 4 ] 2>/dev/null; then
+  warn "Docker reports ${docker_mem_gib} GiB of memory. The containers idle near 450 MiB, but 4 GiB is the comfortable floor."
+fi
+if [ "${docker_cpus:-0}" -lt 2 ] 2>/dev/null || [ "${docker_mem_gib:-0}" -lt 4 ] 2>/dev/null; then
+  if command -v colima >/dev/null 2>&1; then
+    warn "To resize Colima: colima stop && colima start --cpu 4 --memory 8 --disk 60"
+  else
+    warn "Docker Desktop sets these under Settings -> Resources."
+  fi
+fi
+
+# Disk is the one that fails worst and the one this cannot read: the daemon does
+# not report free space, and measuring it means running a container. A full disk
+# makes Qdrant refuse writes with "No space left on device" and makes a Docker
+# build fail without saying why, so it is worth checking by hand before a large
+# ingest: docker system df, and df inside the VM.
+say "About 4 GB of disk is needed for the images, the model and a small corpus"
 
 # --------------------------------------------------------------------------
 # Ollama: the embedding model runs on the host, because that is the only place
