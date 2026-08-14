@@ -564,6 +564,26 @@ def test_retrieve_says_nothing_when_no_knowledge_base_can_be_resolved(
     assert out == ""
 
 
+def test_retrieve_logs_when_no_knowledge_base_can_be_resolved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Retrieval dying silently while record logs the same condition would let a
+    # reader of the log fix half the problem.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("VELOX_HOOK_KNOWLEDGE_BASE", raising=False)
+    _install(
+        monkeypatch,
+        _Recorder(
+            httpx.Response(200, json={"items": [{"id": _KNOWLEDGE_BASE_ID}, {"id": "other"}]})
+        ),
+    )
+
+    _run(monkeypatch, "retrieve", _RETRIEVE_PAYLOAD, capsys)
+
+    logged = (tmp_path / ".veloxrag" / "hook.log").read_text(encoding="utf-8")
+    assert "VELOX_HOOK_KNOWLEDGE_BASE" in logged
+
+
 def test_an_unknown_subcommand_is_logged_and_survived(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

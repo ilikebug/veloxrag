@@ -111,10 +111,12 @@ configuration complaint on every prompt.
 **If the operator ever creates a second knowledge base, auto-resolution stops rather than
 guessing, and both hooks go quiet.** Resolving "the" knowledge base only works when exactly one
 exists; with several, guessing wrong means searching or writing to the wrong memory, so the hook
-disables itself for that invocation instead. Nothing on screen announces this — `retrieve` simply
-stops injecting passages, and `record` writes exactly one line to `~/.veloxrag/hook.log` per call
-("record found no single knowledge base; set VELOX_HOOK_KNOWLEDGE_BASE"). The fix is to set
-`VELOX_HOOK_KNOWLEDGE_BASE` to the intended knowledge base id.
+disables itself for that invocation instead. Nothing on screen announces this — `retrieve` stops
+injecting passages and `record` stops uploading turns, and each writes exactly one line to
+`~/.veloxrag/hook.log` per call: `retrieve found no single knowledge base; set
+VELOX_HOOK_KNOWLEDGE_BASE` and `record found no single knowledge base; set
+VELOX_HOOK_KNOWLEDGE_BASE`, so the log makes clear that both halves stopped, not just one. The fix
+is to set `VELOX_HOOK_KNOWLEDGE_BASE` to the intended knowledge base id.
 
 ## Turning it off
 

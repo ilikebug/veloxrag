@@ -457,6 +457,7 @@ def retrieve(payload: dict[str, object], settings: HookSettings) -> str:
     with build_client(settings) as client:
         knowledge_base_id = resolve_knowledge_base(settings, client)
         if knowledge_base_id is None:
+            _log("retrieve found no single knowledge base; set VELOX_HOOK_KNOWLEDGE_BASE")
             return ""
         response = client.post(
             f"/v1/knowledge-bases/{knowledge_base_id}/search",
