@@ -17,6 +17,7 @@ VELOX_REF="${VELOX_REF:-main}"
 VELOX_HOME="${VELOX_HOME:-$HOME/.veloxrag}"
 VELOX_MODEL="${VELOX_MODEL:-bge-m3}"
 COMPOSE_URL="https://raw.githubusercontent.com/ilikebug/veloxrag/${VELOX_REF}/compose.yaml"
+VELOXRAG_URL="https://raw.githubusercontent.com/ilikebug/veloxrag/${VELOX_REF}/veloxrag"
 API_PORT="${RAG_API_HOST_PORT:-8000}"
 # Only used when Colima is installed and not yet running; see below.
 VELOX_VM_CPU="${VELOX_VM_CPU:-4}"
@@ -121,16 +122,19 @@ else
 fi
 
 # Started as a managed service rather than a bare background process, so that it
-# comes back after a reboot. Without this the stack restarts on its own and then
-# fails every embedding call against a host that is no longer listening.
+# survives the shell that launched it — but deliberately not registered to launch
+# at login. Nothing here adopts a startup item on the user's behalf.
 start_ollama() {
   if curl -fsS --max-time 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
     return 0
   fi
+  # `run` rather than `start`, and `start` rather than `enable --now`: neither
+  # registers anything to launch at login. Starting the machine is the user's
+  # decision, and `veloxrag start` is how the stack comes back afterwards.
   if [ "$OS" = macos ] && command -v brew >/dev/null 2>&1 && brew list ollama >/dev/null 2>&1; then
-    brew services start ollama >/dev/null 2>&1 || true
+    brew services run ollama >/dev/null 2>&1 || true
   elif [ "$OS" = linux ] && command -v systemctl >/dev/null 2>&1; then
-    sudo systemctl enable --now ollama >/dev/null 2>&1 || true
+    sudo systemctl start ollama >/dev/null 2>&1 || true
   fi
   for _ in $(seq 1 30); do
     curl -fsS --max-time 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1 && return 0
@@ -142,7 +146,6 @@ start_ollama() {
 say "Starting Ollama"
 if ! start_ollama; then
   warn "Could not reach Ollama on 127.0.0.1:11434 as a managed service; falling back to a background process."
-  warn "That process will not survive a reboot. See the reboot notes at the end."
   nohup ollama serve >"${TMPDIR:-/tmp}/veloxrag-ollama.log" 2>&1 &
   for _ in $(seq 1 30); do
     curl -fsS --max-time 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1 && break
@@ -168,6 +171,43 @@ say "Fetching compose.yaml into ${VELOX_HOME}"
 curl -fsSL "$COMPOSE_URL" -o "${VELOX_HOME}/compose.yaml.new"
 [ -s "${VELOX_HOME}/compose.yaml.new" ] || die "downloaded compose.yaml is empty; check ${COMPOSE_URL}"
 mv "${VELOX_HOME}/compose.yaml.new" "${VELOX_HOME}/compose.yaml"
+
+# --------------------------------------------------------------------------
+# The veloxrag command. A reboot does not restore a working stack on its own:
+# the containers carry restart: unless-stopped, so the daemon brings some of them
+# back, but a daemon-driven restart does not honour depends_on — that applies
+# only to `docker compose up`. Measured after a VM stop/start, three of seven
+# containers returned and the worker sat in a restart loop. This command is what
+# repairs that, and it is a command rather than a login item on purpose.
+# --------------------------------------------------------------------------
+
+install_command() {
+  local dest="" candidate
+  # A directory already on PATH is worth more than a tidier one that is not,
+  # because a command the user cannot invoke is not installed.
+  for candidate in "$HOME/.local/bin" "$(command -v brew >/dev/null 2>&1 && brew --prefix 2>/dev/null || echo /usr/local)/bin" /usr/local/bin; do
+    case ":${PATH}:" in *":${candidate}:"*) ;; *) continue ;; esac
+    if [ -d "$candidate" ] && [ -w "$candidate" ]; then dest="$candidate"; break; fi
+  done
+  # Nothing writable on PATH: fall back to a conventional location and say what
+  # it costs, rather than failing the whole install over a convenience command.
+  if [ -z "$dest" ]; then
+    dest="$HOME/.local/bin"
+    mkdir -p "$dest" || { warn "could not create ${dest}; skipping the veloxrag command"; return 1; }
+    warn "${dest} is not on your PATH. Add it to use \`veloxrag\`:"
+    warn "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
+  fi
+  curl -fsSL "$VELOXRAG_URL" -o "${dest}/veloxrag.new" 2>/dev/null || {
+    warn "could not download the veloxrag command from ${VELOXRAG_URL}"; return 1; }
+  [ -s "${dest}/veloxrag.new" ] || { warn "downloaded veloxrag is empty"; rm -f "${dest}/veloxrag.new"; return 1; }
+  chmod +x "${dest}/veloxrag.new"
+  mv "${dest}/veloxrag.new" "${dest}/veloxrag"
+  VELOX_COMMAND_PATH="${dest}/veloxrag"
+  say "Installed the veloxrag command at ${VELOX_COMMAND_PATH}"
+}
+
+VELOX_COMMAND_PATH=""
+install_command || true
 
 say "Starting the stack (first run pulls images and initializes the knowledge base)"
 cd "$VELOX_HOME"
@@ -216,24 +256,32 @@ Relevance judgement is left to the agent: retrieve more passages than you need,
 then widen the promising ones with read_document before deciding. The answer
 often sits just outside the passage that matched.
 
-Everyday commands, all from ${VELOX_HOME}:
+Everyday commands:
 
-    docker compose ps                 # what is running
-    docker compose logs -f api        # follow the service log
-    docker compose down               # stop, keeping your data
-    docker compose down -v            # stop and erase the knowledge base
+    veloxrag status              what is running, and whether Ollama and the API answer
+    veloxrag log [service]       follow logs; all services, or one such as api or worker
+    veloxrag restart             restart the containers
+    veloxrag stop                stop the containers, leaving Ollama and Docker alone
 
-After a reboot:
+After a reboot, one command brings everything back:
 
-    Containers come back on their own — they are marked restart: unless-stopped —
-    but only once the Docker daemon is up, so Docker Desktop or Colima has to be
-    set to start at login.
-$(if [ "$OS" = macos ]; then
-    echo "    Ollama: 'brew services list' should show ollama as started."
+    veloxrag start
+
+    It starts Docker, then Ollama, then the containers, in that order. Nothing is
+    registered to launch at login: that choice is yours. The reason this is not
+    automatic is that it cannot be — the containers are marked
+    restart: unless-stopped, but a daemon-driven restart does not honour
+    depends_on, so after a reboot some come back and the worker can land in a
+    restart loop. \`veloxrag start\` is what repairs the order.
+$(if [ -n "$VELOX_COMMAND_PATH" ]; then
+    echo "    Installed at ${VELOX_COMMAND_PATH}."
   else
-    echo "    Ollama: 'systemctl is-enabled ollama' should print enabled."
+    echo "    The command could not be installed; see the warning above. Until then:"
+    echo "    cd ${VELOX_HOME} && docker compose up -d"
   fi)
-    If retrieval fails after a reboot, Ollama is the first thing to check:
-    curl http://127.0.0.1:11434/api/version
+
+To erase the knowledge base and start over:
+
+    cd ${VELOX_HOME} && docker compose down -v
 
 EOF

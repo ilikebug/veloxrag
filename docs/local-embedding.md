@@ -4,7 +4,7 @@ The embedding model runs on the **host** through Ollama, not in a container. Eve
 the stack stays containerized.
 
 ```bash
-brew install ollama && brew services start ollama   # macOS; Linux: curl -fsSL https://ollama.com/install.sh | sh
+brew install ollama && brew services run ollama   # macOS; Linux: curl -fsSL https://ollama.com/install.sh | sh
 ollama pull bge-m3
 ```
 
@@ -72,10 +72,18 @@ deployment.
 
 ## 5. After a reboot
 
-The containers carry `restart: unless-stopped` and come back on their own, but only once the
-Docker daemon is up — so Docker Desktop or Colima has to start at login. Ollama is a host
-process and needs its own arrangement: `brew services start ollama` on macOS, or the systemd
-unit the official installer enables on Linux.
+`veloxrag start` is the one command that brings the stack back, and it exists because a reboot
+does not restore a working one on its own. The containers carry `restart: unless-stopped`, but a
+daemon-driven restart does not honour `depends_on` — that applies only to `docker compose up`.
+Measured after a VM stop/start: three of seven containers returned, and the worker sat in a
+restart loop, having exhausted its attempts against dependencies that were not yet up. The
+command starts Docker, then Ollama, then the containers in order, and restarts anything that had
+given up.
+
+Ollama is a host process, so it needs starting too — `veloxrag start` does that, and by hand it is
+`brew services run ollama` on macOS or `systemctl start ollama` on Linux. Neither the installer
+nor the command registers a launch-at-login item; `run` rather than `start` is what keeps `brew
+services` from adding one.
 
 If retrieval fails after a reboot, Ollama is the first thing to check:
 

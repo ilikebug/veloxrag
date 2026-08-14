@@ -32,12 +32,34 @@ What it needs first:
   that is the only place it reaches the GPU: Docker on macOS is a Linux VM with no Metal
   passthrough, measured at 3.10 chunks/s against 14.20 on the host, and the flat batch curve says
   the container is compute-bound rather than badly tuned. `install.sh` handles it; by hand it is
-  `brew install ollama && brew services start ollama && ollama pull bge-m3`.
+  `brew install ollama && brew services run ollama && ollama pull bge-m3` (`run` rather than
+  `start`, which would also register a launch-at-login item).
 
-After a reboot the containers come back on their own — they carry `restart: unless-stopped` — but
-only once the Docker daemon is up, so Docker Desktop or Colima has to start at login. Ollama is a
-host process with its own arrangement (`brew services` on macOS, a systemd unit on Linux). If
-retrieval fails after a reboot, check Ollama first: `curl http://127.0.0.1:11434/api/version`.
+It also installs a `veloxrag` command, which is how the stack comes back after a reboot:
+
+```bash
+veloxrag start
+```
+
+That starts Docker, then Ollama, then the containers, in that order. Nothing is registered to
+launch at login — and that ordering is the reason a command is needed rather than merely
+convenient. The containers carry `restart: unless-stopped`, but a daemon-driven restart does not
+honour `depends_on`, which applies only to `docker compose up`. Measured after a VM stop/start:
+three of seven containers returned, and the worker sat in a restart loop having exhausted its
+attempts against dependencies that were not up yet. `veloxrag start` repairs the order and gives a
+service that has given up one further nudge — 7 seconds, from that state to healthy.
+
+| Command | What it does |
+| --- | --- |
+| `veloxrag start` | Docker, Ollama and the containers, in dependency order |
+| `veloxrag stop` | the containers only; Ollama and Docker are left alone, since other things may be using them |
+| `veloxrag restart` | the containers only |
+| `veloxrag status` | what is running, and whether Ollama and the API answer |
+| `veloxrag log [service]` | follow logs, all services or one such as `api` or `worker` |
+
+Plain `docker compose` still works from `~/.veloxrag`; the command adds the ordering and the
+Ollama check, not a wrapper you are obliged to use. If retrieval fails and you would rather check
+by hand, Ollama is the first suspect: `curl http://127.0.0.1:11434/api/version`.
 
 Upgrading from a release that ran the embedding model in a container, pass `--remove-orphans`
 once. Compose only removes containers it still knows about, and the retired `embedding-model` is

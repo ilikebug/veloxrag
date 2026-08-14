@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# VeloxRAG control command, installed by install.sh.
+#
+#   veloxrag start | stop | restart | status | log
+#
+# Exists because a reboot does not restore a working stack on its own. The
+# containers carry restart: unless-stopped, so the daemon brings some of them
+# back — but a daemon-driven restart does not honour depends_on, which applies
+# only to `docker compose up`. Measured after stopping and starting the VM: three
+# of seven containers returned and the worker sat in a restart loop, having
+# exhausted its attempts against dependencies that were not up yet. `up -d`
+# repairs the order; a worker that already burned its restarts needs one more
+# nudge, which `start` does.
+#
+# Nothing here is registered to launch at login. Starting the machine is the
+# user's decision, so this command exists to be run rather than to run itself.
+set -euo pipefail
+
+VELOX_HOME="${VELOX_HOME:-$HOME/.veloxrag}"
+VELOX_VM_CPU="${VELOX_VM_CPU:-4}"
+VELOX_VM_MEMORY="${VELOX_VM_MEMORY:-8}"
+VELOX_VM_DISK="${VELOX_VM_DISK:-60}"
+API_PORT="${RAG_API_HOST_PORT:-8000}"
+
+say() { printf '\033[1m==>\033[0m %s\n' "$1"; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$1" >&2; }
+die() { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+
+compose() {
+  [ -f "${VELOX_HOME}/compose.yaml" ] \
+    || die "no compose.yaml in ${VELOX_HOME}. Re-run the installer."
+  COMPOSE_DISABLE_ENV_FILE=1 docker compose --project-directory "$VELOX_HOME" "$@"
+}
+
+ollama_up() { curl -fsS --max-time 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1; }
+
+start_ollama() {
+  ollama_up && return 0
+  command -v ollama >/dev/null 2>&1 || die "Ollama is not installed. Re-run the installer."
+  say "Starting Ollama"
+  # `run` rather than `start`: brew's `start` also registers a launch-at-login
+  # item, and adopting one on the user's behalf is not this command's business.
+  if command -v brew >/dev/null 2>&1 && brew list ollama >/dev/null 2>&1; then
+    brew services run ollama >/dev/null 2>&1 || true
+  elif [ -d /Applications/Ollama.app ]; then
+    open -a Ollama >/dev/null 2>&1 || true
+  elif command -v systemctl >/dev/null 2>&1; then
+    sudo systemctl start ollama >/dev/null 2>&1 || true
+  fi
+  for _ in $(seq 1 30); do
+    ollama_up && return 0
+    sleep 1
+  done
+  nohup ollama serve >"${TMPDIR:-/tmp}/veloxrag-ollama.log" 2>&1 &
+  for _ in $(seq 1 30); do
+    ollama_up && return 0
+    sleep 1
+  done
+  return 1
+}
+
+start_docker() {
+  docker info >/dev/null 2>&1 && return 0
+  command -v colima >/dev/null 2>&1 \
+    || die "Docker is not running. Start Docker Desktop, or install Colima."
+
+  # The daemon can be unreachable for two different reasons, and they need
+  # different fixes. Either the VM is down, or the VM is up while the socket the
+  # docker CLI points at is stale — seen after a stop/start cycle, where colima
+  # reports running and every command still fails to connect. A start does not
+  # repair the second; a restart does.
+  if colima status >/dev/null 2>&1; then
+    say "Colima is running but the Docker socket is not answering; restarting it"
+    say "This takes a minute or two — the VM has to come down and back up"
+    colima restart >/dev/null 2>&1 || die "colima restart failed"
+  else
+    # Resources are passed only when the VM does not exist yet. Handing them to
+    # an existing instance rewrites its saved config without resizing the running
+    # VM, which silently shrinks the machine at its next start.
+    if colima list 2>/dev/null | grep -qE "^default[[:space:]]"; then
+      say "Starting Colima — this takes a minute or two"
+      colima start >/dev/null 2>&1 || die "colima start failed"
+    else
+      say "Creating the Colima VM with ${VELOX_VM_CPU} CPUs, ${VELOX_VM_MEMORY} GiB and ${VELOX_VM_DISK} GiB"
+      say "Override with VELOX_VM_CPU / VELOX_VM_MEMORY / VELOX_VM_DISK; the disk can grow later but not shrink"
+      colima start --cpu "$VELOX_VM_CPU" --memory "$VELOX_VM_MEMORY" --disk "$VELOX_VM_DISK" \
+        >/dev/null 2>&1 || die "colima start failed"
+    fi
+  fi
+
+  # colima registers its own docker context, and a lost or unselected one leaves
+  # the CLI aimed at /var/run/docker.sock, which does not exist on macOS.
+  if ! docker info >/dev/null 2>&1 && docker context inspect colima >/dev/null 2>&1; then
+    say "Pointing the Docker CLI at Colima's context"
+    docker context use colima >/dev/null 2>&1 || true
+  fi
+
+  docker info >/dev/null 2>&1 \
+    || die "Docker still unreachable. Try: colima restart"
+}
+
+cmd_start() {
+  start_docker
+  start_ollama || die "Ollama did not answer on 127.0.0.1:11434"
+  say "Starting the stack"
+  compose up -d
+  # A container that exhausted its restart budget while its dependencies were
+  # down stays down after `up -d`, because up sees it as already created. One
+  # targeted restart clears that without disturbing anything healthy.
+  local stuck
+  stuck="$(compose ps --status restarting --format '{{.Service}}' 2>/dev/null || true)"
+  if [ -n "$stuck" ]; then
+    say "Restarting services that had given up: $(echo "$stuck" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    compose restart $stuck >/dev/null
+  fi
+  for _ in $(seq 1 45); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1; then
+      say "Ready at http://127.0.0.1:${API_PORT}"
+      return 0
+    fi
+    sleep 2
+  done
+  warn "The API did not answer on 127.0.0.1:${API_PORT}. Try: veloxrag log api"
+  return 1
+}
+
+cmd_stop() {
+  # Containers only. Colima and Ollama are left running because other things on
+  # the machine may be using them, and data volumes are untouched either way.
+  say "Stopping the containers"
+  compose stop
+}
+
+cmd_restart() {
+  say "Restarting the containers"
+  compose restart
+}
+
+cmd_status() {
+  compose ps
+  printf '\n'
+  if ollama_up; then
+    printf '  ollama    reachable on 127.0.0.1:11434\n'
+  else
+    printf '  ollama    NOT reachable — embedding and search will fail\n'
+  fi
+  if curl -fsS --max-time 3 "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1; then
+    printf '  api       healthy on 127.0.0.1:%s\n' "$API_PORT"
+  else
+    printf '  api       not answering on 127.0.0.1:%s\n' "$API_PORT"
+  fi
+}
+
+cmd_log() {
+  if [ "$#" -eq 0 ]; then
+    compose logs --tail 200 -f
+  else
+    compose logs --tail 200 -f "$@"
+  fi
+}
+
+case "${1:-}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  status) cmd_status ;;
+  log | logs) shift; cmd_log "$@" ;;
+  *)
+    cat <<EOF
+veloxrag — control the local RAG stack
+
+  veloxrag start          bring up Ollama, Docker and the containers
+  veloxrag stop           stop the containers, leaving Ollama and Docker alone
+  veloxrag restart        restart the containers
+  veloxrag status         what is running, and whether Ollama and the API answer
+  veloxrag log [service]  follow logs; all services, or one such as api or worker
+
+Nothing is registered to launch at login: run \`veloxrag start\` after a reboot.
+The stack lives in ${VELOX_HOME}, and plain \`docker compose\` works there too.
+EOF
+    [ -n "${1:-}" ] && exit 2
+    exit 0
+    ;;
+esac
