@@ -161,8 +161,12 @@ Or, for a client that takes a config file:
       }
     }
 
-It exposes three read-only tools: search_memory, list_documents, memory_status.
-No token and no knowledge base id are needed.
+It exposes four read-only tools: search_memory, read_document, list_documents and
+memory_status. No token and no knowledge base id are needed.
+
+Relevance judgement is left to the agent: retrieve more passages than you need,
+then widen the promising ones with read_document before deciding. The answer
+often sits just outside the passage that matched.
 
 Everyday commands, all from ${VELOX_HOME}:
 
