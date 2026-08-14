@@ -190,6 +190,10 @@ def test_compose_api_environment_respects_rag_overrides() -> None:
         "RAG_MAX_PAGE_SIZE": "${RAG_MAX_PAGE_SIZE:-100}",
         "RAG_MAX_API_KEY_REQUESTS_PER_MINUTE": ("${RAG_MAX_API_KEY_REQUESTS_PER_MINUTE:-10000}"),
         "RAG_MAX_API_KEY_CONCURRENCY": "${RAG_MAX_API_KEY_CONCURRENCY:-1000}",
+        # Pinned because compose omitting these is silent: the container falls back
+        # to the built-in default and tuning the variable appears to do nothing.
+        "RAG_CHUNK_MAX_CODEPOINTS": "${RAG_CHUNK_MAX_CODEPOINTS:-600}",
+        "RAG_CHUNK_OVERLAP_CODEPOINTS": "${RAG_CHUNK_OVERLAP_CODEPOINTS:-100}",
     }
 
     for name, interpolation in expected_environment.items():
@@ -223,6 +227,24 @@ def test_compose_publishes_ports_on_loopback_only() -> None:
         # override was dropped on one of the two sides.
         assert f'"{port}:{port}"' not in compose
         assert f'"127.0.0.1:{port}:{port}"' not in compose
+
+
+def test_documented_operation_count_matches_the_application() -> None:
+    """The docs quote a number that nothing kept in step, and it had already drifted.
+
+    Counting operations rather than paths because that is what a caller sees: a GET
+    and a POST on one path are two things to call.
+    """
+
+    from rag_service.main import create_app
+
+    methods = {"get", "post", "put", "patch", "delete"}
+    schema = create_app().openapi()
+    operations = sum(1 for item in schema["paths"].values() for method in item if method in methods)
+
+    for relative in ("README.md", "docs/api-operations.md"):
+        document = (ROOT / relative).read_text()
+        assert f"all {operations} operations" in document.lower(), relative
 
 
 def test_dockerfile_uses_pinned_python_and_uv_images() -> None:

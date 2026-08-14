@@ -236,7 +236,7 @@ from the service itself** (generated from the code, so it cannot go stale):
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /openapi.json` | All 25 endpoints and schemas. Point an AI or a tool at this one |
+| `GET /openapi.json` | All 39 operations and their schemas. Point an AI or a tool at this one |
 | `GET /docs` | Swagger UI, interactive (frontend assets come from a CDN, so it needs network) |
 | `GET /redoc` | ReDoc |
 

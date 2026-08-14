@@ -6,7 +6,7 @@ authoritative guide to operating it.
 The complete machine-readable contract comes from the service itself. **Prefer it** — it is
 generated from the code and cannot go stale:
 
-- `GET /openapi.json` — all 25 endpoints with request/response schemas (feed this one to an AI)
+- `GET /openapi.json` — all 39 operations with request/response schemas (feed this one to an AI)
 - `GET /docs` — Swagger UI, interactive (frontend assets come from a CDN, so it needs network)
 - `GET /redoc` — ReDoc
 
