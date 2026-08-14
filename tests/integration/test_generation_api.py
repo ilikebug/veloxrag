@@ -689,20 +689,24 @@ async def test_generation_idempotency_replays_and_rejects_payload_or_new_key_con
         )
         _assert_error(reused, 409, "IDEMPOTENCY_KEY_REUSED", reused_id)
 
-        configured_id = "req-generation-already-configured"
-        configured = await client.post(
+        # A second generation alongside an active one is a cutover, which is the
+        # only way to change an embedding model, a chunk size or a filter schema
+        # without abandoning the knowledge base. It succeeds, and the predecessor
+        # retires in the same transaction: a partial unique index permits one
+        # active generation per knowledge base, so a swap that left both active
+        # would be rejected by the database rather than observed by a reader.
+        cutover_id = "req-generation-cutover"
+        cutover = await client.post(
             path,
-            headers=_headers(token, configured_id, "generation-other-key"),
+            headers=_headers(token, cutover_id, "generation-other-key"),
             json=command,
         )
-        _assert_error(
-            configured,
-            409,
-            "INDEX_GENERATION_ALREADY_CONFIGURED",
-            configured_id,
-        )
+        assert cutover.status_code == 201, cutover.text
+        assert cutover.json()["status"] == "active"
 
-    assert len(await _generation_rows(migrated_database, knowledge_base_id)) == 1
+    rows = await _generation_rows(migrated_database, knowledge_base_id)
+    assert len(rows) == 2
+    assert sorted(row.status for row in rows) == ["active", "retiring"]
 
 
 @pytest.mark.integration

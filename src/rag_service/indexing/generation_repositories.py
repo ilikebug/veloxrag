@@ -118,6 +118,8 @@ class GenerationRepository(Protocol):
 
     async def configured_generation_exists(self, knowledge_base_id: UUID) -> bool: ...
 
+    async def building_generation_exists(self, knowledge_base_id: UUID) -> bool: ...
+
     async def load_embedding_source(
         self,
         profile_id: UUID,
@@ -253,6 +255,25 @@ class SqlAlchemyGenerationRepository:
             .where(
                 KnowledgeBaseIndexGeneration.knowledge_base_id == knowledge_base_id,
                 KnowledgeBaseIndexGeneration.status.in_(("building", "active")),
+            )
+            .order_by(KnowledgeBaseIndexGeneration.id)
+            .limit(1)
+        )
+        return (await self._session.scalar(statement)) is not None
+
+    async def building_generation_exists(self, knowledge_base_id: UUID) -> bool:
+        """Whether a generation is mid-creation, as opposed to merely existing.
+
+        A cutover creates a second generation while the first is still serving, so
+        the presence of an active one no longer disqualifies a request; a half-built
+        one still does, because two builds would race for the same pending pointer.
+        """
+
+        statement = (
+            select(KnowledgeBaseIndexGeneration.id)
+            .where(
+                KnowledgeBaseIndexGeneration.knowledge_base_id == knowledge_base_id,
+                KnowledgeBaseIndexGeneration.status == "building",
             )
             .order_by(KnowledgeBaseIndexGeneration.id)
             .limit(1)

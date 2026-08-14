@@ -930,10 +930,15 @@ class GenerationService:
                     "GENERATION_CONFIGURATION_CONFLICT",
                     "Generation configuration changed during creation",
                 )
+            # An active generation no longer disqualifies the request: creating a
+            # second one alongside it is how a cutover starts, which is the only
+            # way to change an embedding model, a chunk size or a filter schema
+            # without abandoning the knowledge base. What still disqualifies it is
+            # another build already in flight — two would race for the same pending
+            # pointer, and the loser would leave a collection nothing points at.
             if (
-                knowledge_base.active_index_generation_id is not None
-                or knowledge_base.pending_index_generation_id is not None
-                or await repository.configured_generation_exists(knowledge_base_id)
+                knowledge_base.pending_index_generation_id is not None
+                or await repository.building_generation_exists(knowledge_base_id)
             ):
                 raise BusinessError(
                     409,
@@ -1144,7 +1149,7 @@ class GenerationService:
                 generation.status != "building"
                 or knowledge_base.status != "active"
                 or knowledge_base.pending_index_generation_id != generation.id
-                or knowledge_base.active_index_generation_id is not None
+                or knowledge_base.active_index_generation_id == generation.id
                 or knowledge_base.filter_schema_revision != reservation.filter_schema_revision
             ):
                 generation.status = "failed"
@@ -1206,6 +1211,26 @@ class GenerationService:
                         },
                     )
                 )
+                # The swap and the retirement share this transaction on purpose. A
+                # window where neither generation is active would make every
+                # indexed document unsearchable, and one where both are would let
+                # a reader see either.
+                superseded = (
+                    await repository.get_generation(
+                        knowledge_base.active_index_generation_id,
+                        for_update=True,
+                    )
+                    if knowledge_base.active_index_generation_id is not None
+                    else None
+                )
+                if superseded is not None:
+                    # Retired and flushed before the successor is promoted, because
+                    # uq_kb_index_generations_one_active is a partial unique index
+                    # over status = 'active'. Assigning both in one flush presents
+                    # the index with two active rows for this knowledge base and it
+                    # rejects the transaction, which is the constraint doing its job.
+                    superseded.status = "retiring"
+                    await repository.flush()
                 generation.status = "active"
                 knowledge_base.pending_index_generation_id = None
                 knowledge_base.active_index_generation_id = generation.id
