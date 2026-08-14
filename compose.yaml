@@ -66,6 +66,13 @@ x-api-environment: &api-environment
   RAG_MAX_PAGE_SIZE: ${RAG_MAX_PAGE_SIZE:-100}
   RAG_MAX_API_KEY_REQUESTS_PER_MINUTE: ${RAG_MAX_API_KEY_REQUESTS_PER_MINUTE:-10000}
   RAG_MAX_API_KEY_CONCURRENCY: ${RAG_MAX_API_KEY_CONCURRENCY:-1000}
+  # Chunking is the largest single lever on retrieval quality, and without these
+  # two lines the setting is documented but unreachable: compose would pass
+  # nothing, the container would fall back to the built-in default, and changing
+  # the variable would appear to do nothing without reporting an error. The
+  # worker reads them at process start, so a change needs a worker restart.
+  RAG_CHUNK_MAX_CODEPOINTS: ${RAG_CHUNK_MAX_CODEPOINTS:-600}
+  RAG_CHUNK_OVERLAP_CODEPOINTS: ${RAG_CHUNK_OVERLAP_CODEPOINTS:-100}
 
 x-rag-runtime: &rag-runtime
   <<: *rag-image
