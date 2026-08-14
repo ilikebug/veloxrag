@@ -28,7 +28,8 @@ from typing import Any
 from uuid import uuid4
 
 DEFAULT_KNOWLEDGE_BASE_NAME = "local-memory"
-DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
+# Ollama names a model by what was pulled, not by its Hugging Face path.
+DEFAULT_EMBEDDING_MODEL = "bge-m3"
 DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 
 # The nine fields the roadmap settled on. Set once here because the filter schema

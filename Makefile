@@ -79,35 +79,28 @@ up:
 	COMPOSE_DISABLE_ENV_FILE=1 docker compose -f compose.yaml -f compose.build.yaml build api
 	COMPOSE_DISABLE_ENV_FILE=1 docker compose -f compose.yaml -f compose.build.yaml up -d --no-build
 
-# The one command for a working local stack: datastores, object store, the
-# containerised embedding model, and a bootstrap that creates the provider
-# config, model profile, knowledge base, filter schema and initial generation.
+# The one command for a working local stack: datastores, object store, and a
+# bootstrap that creates the provider config, model profile, knowledge base,
+# filter schema and initial generation. Embeddings come from the host's Ollama,
+# which is the only place the model reaches the GPU.
 # After it finishes, point an MCP client at `velox-mcp` and it works.
 #
 # Only convenience over `docker compose up`: it builds the api image from the
-# working tree and picks the embedding image for this machine's architecture.
-# Everything else, including the two local-only switches, lives in compose.yaml
-# so that downloading that file alone is enough.
+# working tree and checks Ollama first, because a stack that starts without it
+# fails every embedding call rather than failing to start.
 start:
 	@redis_port='$(RAG_REDIS_HOST_PORT)'; \
 	if [ "$$redis_port" = "auto" ]; then \
 		redis_port=$$(python3 -c 'import socket; probe = socket.socket(); print(6380 if probe.connect_ex(("127.0.0.1", 6379)) == 0 else 6379); probe.close()'); \
 	fi; \
-	image_tag='$(RAG_EMBEDDING_IMAGE_TAG)'; \
-	if [ -z "$$image_tag" ]; then \
-		case "$$(uname -m)" in \
-		arm64|aarch64) image_tag=cpu-arm64-latest ;; \
-		*) image_tag=cpu-latest ;; \
-		esac; \
-	fi; \
-	echo "starting stack: redis host port $$redis_port, embedding image $$image_tag"; \
-	echo "the first run downloads several GB of model weights; see docs/mcp.md"; \
+	curl -fsS --max-time 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1 \
+		|| { echo "Ollama is not answering on 127.0.0.1:11434; start it first (brew services start ollama)"; exit 1; }; \
+	echo "starting stack: redis host port $$redis_port, embeddings from the host Ollama"; \
 	COMPOSE_DISABLE_ENV_FILE=1 docker compose -f compose.yaml -f compose.build.yaml build api && \
 	COMPOSE_DISABLE_ENV_FILE=1 \
 		RAG_REDIS_HOST_PORT="$$redis_port" \
-		RAG_EMBEDDING_IMAGE_TAG="$$image_tag" \
 		docker compose -f compose.yaml -f compose.build.yaml up -d --no-build && \
-	COMPOSE_DISABLE_ENV_FILE=1 RAG_REDIS_HOST_PORT="$$redis_port" RAG_EMBEDDING_IMAGE_TAG="$$image_tag" \
+	COMPOSE_DISABLE_ENV_FILE=1 RAG_REDIS_HOST_PORT="$$redis_port" \
 		docker compose -f compose.yaml -f compose.build.yaml wait bootstrap >/dev/null && \
 	echo "api: http://127.0.0.1:$(RAG_API_HOST_PORT)/health" && \
 	echo "mcp: uv run velox-mcp   (needs no token and no knowledge base id)"

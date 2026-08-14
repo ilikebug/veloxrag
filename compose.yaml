@@ -233,41 +233,6 @@ services:
       - embedding_server_tls:/run/rag/embedding-server-tls
     restart: "no"
 
-  embedding-model:
-    # text-embeddings-inference publishes no multi-architecture tag, so this
-    # default has to name one architecture and it is the arm64 one. On x86_64
-    # run `RAG_EMBEDDING_IMAGE_TAG=cpu-latest docker compose up -d` — without it
-    # the container fails to start with an exec format error, which does not
-    # mention the tag. `make start` picks the tag from `uname -m` instead.
-    image: ghcr.io/huggingface/text-embeddings-inference:${RAG_EMBEDDING_IMAGE_TAG:-cpu-arm64-latest}
-    command:
-      [
-        "--model-id",
-        "${RAG_EMBEDDING_MODEL_ID:-BAAI/bge-m3}",
-        "--auto-truncate",
-        # Left at TEI's default these warm up against the model's full
-        # 8192-token window and the container is OOM-killed on a 16 GB host.
-        "--max-batch-tokens",
-        "${RAG_EMBEDDING_MAX_BATCH_TOKENS:-4096}",
-        "--max-batch-requests",
-        "4",
-        # Kept in step with max-batch-tokens rather than set independently: a
-        # 600-codepoint chunk of technical prose runs past 256 tokens, so a
-        # client batch of 16 overruns 4096 and comes back 429. 8 is measured to
-        # fit. Model profiles should use a batch_size no larger than this.
-        "--max-client-batch-size",
-        "${RAG_EMBEDDING_MAX_CLIENT_BATCH_SIZE:-8}",
-        # Queue depth, not a memory bound — memory is governed by the two limits
-        # above. TEI rejects with 429 rather than blocking once the permits are
-        # gone, and an ingest worker treats that as a provider failure and burns
-        # its retries, so this has to be wide enough to absorb a batch import.
-        "--max-concurrent-requests",
-        "${RAG_EMBEDDING_MAX_CONCURRENT_REQUESTS:-256}",
-      ]
-    volumes:
-      - embedding_model_cache:/data
-    restart: unless-stopped
-
   embedding:
     image: nginx:1.27-alpine
     volumes:
@@ -278,14 +243,19 @@ services:
     configs:
       - source: embedding_proxy
         target: /etc/nginx/nginx.conf
+    # host-gateway is how a container reaches a service on the host. Ollama runs
+    # on the host because that is the only way it reaches the GPU: Docker on
+    # macOS is a Linux VM with no Metal passthrough, which measured 3.1 chunks/s
+    # against 14.2 on the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       embedding-tls-init:
         condition: service_completed_successfully
-      embedding-model:
-        condition: service_started
     healthcheck:
       # Probes through the proxy so readiness means "the model answers", not
-      # "nginx started". start_period covers the first-run model download.
+      # "nginx started". /api/version is Ollama's liveness path — it has no
+      # /health, and probing one gets a permanent 404 that never resolves.
       test:
         [
           "CMD",
@@ -294,7 +264,7 @@ services:
           "--tries=1",
           "--no-check-certificate",
           "--output-document=/dev/null",
-          "https://127.0.0.1/health",
+          "https://127.0.0.1/api/version",
         ]
       interval: 10s
       timeout: 5s
@@ -430,6 +400,7 @@ configs:
 
       http {
         access_log off;
+        resolver 127.0.0.11 valid=10s ipv6=off;
 
         server {
           listen 443 ssl;
@@ -443,7 +414,13 @@ configs:
           client_max_body_size 32m;
 
           location / {
-            proxy_pass http://embedding-model:80;
+            # Resolved per request through Docker's embedded DNS rather than at
+            # startup. nginx resolves a literal upstream when it boots and
+            # refuses to start if that name is missing, so a stopped Ollama
+            # would take the whole stack down instead of just failing the
+            # embedding call.
+            set $$embedding_upstream host.docker.internal;
+            proxy_pass http://$$embedding_upstream:11434;
             proxy_http_version 1.1;
             # A cold model can take minutes to answer the first request on CPU.
             proxy_read_timeout 900s;
@@ -461,4 +438,3 @@ volumes:
   provider_server_tls:
   embedding_ca:
   embedding_server_tls:
-  embedding_model_cache:

@@ -16,25 +16,29 @@ an agent actually needs.
 
 ## Using it
 
-`compose.yaml` is all you need (Docker Compose 2.23.1 or newer — the file carries the embedding
-proxy's nginx configuration inline as a compose config, and inline `content` only exists from that
-version on):
+One command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ilikebug/veloxrag/main/install.sh | bash
+```
+
+It installs Ollama if missing, pulls `bge-m3` (about 1.2 GB, once), writes `compose.yaml` into
+`~/.veloxrag`, starts the stack, and prints the MCP command.
+
+The embedding model runs on the **host**, not in a container, because that is the only place it
+reaches the GPU: Docker on macOS is a Linux VM with no Metal passthrough, measured at 3.1
+chunks/s against 14.2 on the host. Everything else stays containerized.
+
+With Ollama already running, `compose.yaml` alone is still the whole stack (Docker Compose 2.23.1
+or newer — the file carries the embedding proxy's nginx configuration inline as a compose config,
+and inline `content` only exists from that version on):
 
 ```bash
 docker compose up -d
 ```
 
-That brings up the databases, the object store, and the **containerized embedding model** in one
-step, and completes initialization on its own: provider configuration, dimension probe, model
-profile, knowledge base, filter schema, initial generation. The first start downloads about
-4.8 GB of weights; later starts take a few minutes.
-
-x86_64 machines need one extra variable, because text-embeddings-inference publishes no
-multi-architecture tag:
-
-```bash
-RAG_EMBEDDING_IMAGE_TAG=cpu-latest docker compose up -d
-```
+It completes initialization on its own: provider configuration, dimension probe, model profile,
+knowledge base, filter schema, initial generation.
 
 The MCP client then needs one command and no environment variables. **No checkout required** —
 `uvx` runs the server straight from the public repository, which is the MCP-side counterpart of
@@ -72,7 +76,7 @@ immediately:
 ```
 
 (When developing inside the repository use `make start`, which does two extra things: rebuild the
-api image from the working tree, and pick the embedding image tag from `uname -m`.)
+api image from the working tree, and refuse to start when Ollama is not answering.)
 
 All three variables are optional:
 
@@ -96,8 +100,9 @@ auditing, and rate limiting are unchanged. An **invalid** token is still rejecte
 mode covers only the "no credential at all" case. The two provisioned key digests are random, so
 no token can compute them.
 
-**`RAG_PROVIDER_ALLOW_PRIVATE_TARGETS`** is needed because the containerized embedding service is
-`https://embedding` on the Docker network, which is a private address. There is an easy mistake to
+**`RAG_PROVIDER_ALLOW_PRIVATE_TARGETS`** is needed because the embedding endpoint is
+`https://embedding` on the Docker network — an nginx that terminates TLS in front of the host's
+Ollama — and that is a private address. There is an easy mistake to
 make here: the provider policy performs **two independent checks** — it must be https, and it must
 not be a private IP. The nginx layer in the middle only solves the first. The second is based on
 the **resolved IP**, so renaming the network or gathering the components onto one internal network
@@ -141,6 +146,7 @@ upload (`POST /v1/knowledge-bases/{kb}/documents`, no token). After that an agen
 - **One server binds one knowledge base.** Searching across several means running several MCP
   servers; the service itself does not support cross-KB search either.
 - **A hit is a fragment, not a whole document.** Results carry `source.start_offset` /
-  `end_offset`, but there is currently **no endpoint that reads the original text back by
-  range**, so when a fragment is cut off the only remedies are a larger `top_k` or a different
-  phrasing.
+  `end_offset`, and `GET /v1/documents/{id}/content?start=&end=` reads that range back, so a
+  truncated hit can be widened. Measured over transcript queries, widening by 300 characters
+  moved answer-level MRR from 0.675 to 0.756 and took @5 and @10 to 1.00. The MCP tools do not
+  expose it yet — a consumer that wants it calls the HTTP endpoint directly.

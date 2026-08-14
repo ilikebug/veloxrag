@@ -12,11 +12,11 @@ same-generation Qdrant disaster recovery.
   nginx configuration inline as a compose config, so that downloading that one file is the
   whole install, and inline `content` only exists from 2.23.1 on. Older versions parse the
   file but mount nothing, which surfaces as the nginx container failing to start.
-- **On x86_64 you must start with `RAG_EMBEDDING_IMAGE_TAG=cpu-latest`** — the embedding model
-  image, text-embeddings-inference, publishes no multi-architecture tag, and the default in
-  compose.yaml is the arm64 one (Apple Silicon). Omitting the variable surfaces as a container
-  that fails to start with an exec format error, and the error does not mention the image tag.
-  Inside the repository `make start` picks the tag from `uname -m`, so you do not pass it there.
+- **Ollama on the host, with `bge-m3` pulled.** The embedding model runs on the host rather than
+  in a container because that is the only place it reaches the GPU: Docker on macOS is a Linux VM
+  with no Metal passthrough, measured at 3.1 chunks/s against 14.2 on the host. `install.sh`
+  handles this; doing it by hand is `brew install ollama && brew services start ollama &&
+  ollama pull bge-m3`.
 - Every Compose operation sets `COMPOSE_DISABLE_ENV_FILE=1` explicitly. Do not rely on Compose
   reading a dotenv file implicitly; ordinary configuration is passed as explicit environment
   variables, and secrets are injected through environment variables or an approved secret
@@ -266,20 +266,36 @@ queries change position, and the rest pay for a provider round trip for nothing.
 deployment requirement — see the reranker batch limit in
 [docs/deployment.md](docs/deployment.md).
 
-**`compose.yaml` alone is enough**: `docker compose up -d` brings up the containerized embedding
-model (`BAAI/bge-m3`, 1024 dimensions) along with everything else, and completes the provider
-configuration, model profile, knowledge base, filter schema, and initial generation on its own;
-after that an MCP client needs no configuration to search. The first start downloads about
-4.8 GB of weights.
+**One command installs everything**:
 
 ```bash
-docker compose up -d                                        # arm64 / Apple Silicon
-RAG_EMBEDDING_IMAGE_TAG=cpu-latest docker compose up -d      # x86_64
+curl -fsSL https://raw.githubusercontent.com/ilikebug/veloxrag/main/install.sh | bash
 ```
 
-Inside the repository use `make start`, which additionally rebuilds the api image and picks the
-architecture. To make the one-file install true, compose defaults two switches that hold only
-locally; see [docs/mcp.md](docs/mcp.md). The service refuses to start with either of them in a
+It installs Ollama if it is missing, pulls `bge-m3` (about 1.2 GB, once), writes `compose.yaml`
+into `~/.veloxrag`, starts the stack, and prints the MCP command. Everything after the model
+pull is idempotent, so re-running it converges rather than reinstalling, and it never touches
+existing data volumes.
+
+Upgrading from a release that ran the embedding model in a container: pass `--remove-orphans`
+once. Compose only removes containers it still knows about, and the retired `embedding-model` is
+no longer in the file, so it keeps running and holding memory until told otherwise.
+
+```bash
+docker compose up -d --remove-orphans
+```
+
+With Ollama already running, `compose.yaml` on its own is still the whole stack — the file
+completes the provider configuration, model profile, knowledge base, filter schema, and initial
+generation by itself, and an MCP client then needs no configuration to search:
+
+```bash
+docker compose up -d
+```
+
+Inside the repository use `make start`, which additionally rebuilds the api image and refuses to
+start when Ollama is not answering. To make the one-file install true, compose defaults two
+switches that hold only locally; see [docs/mcp.md](docs/mcp.md). The service refuses to start with either of them in a
 production environment. If a host port collides with something already running, see
 [Host ports](#host-ports) above.
 
