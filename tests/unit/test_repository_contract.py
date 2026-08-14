@@ -678,7 +678,7 @@ def test_readme_single_file_cli_outputs_cleanup_and_propagate_failure(
     assert "trap - EXIT HUP INT TERM" not in admin_creation
     assert "cleanup_admin_bootstrap || exit 1" in admin_cleanup
     assert "trap - EXIT HUP INT TERM" in admin_cleanup
-    admin_section = readme.split("## Admin and Agent keys", maxsplit=1)[1].split(
+    admin_section = readme.split("### 1.1 Minting Admin and Agent keys", maxsplit=1)[1].split(
         "Inspect security metadata, or revoke an Admin key", maxsplit=1
     )[0]
     assert "dedicated Bash" in admin_section
@@ -768,8 +768,8 @@ def test_readme_repair_extracts_a_validated_job_id_before_cleanup(tmp_path: Path
     assert "cat " not in repair_block
 
     readme = _operations_doc()
-    repair_section = readme.split("## Same-generation Qdrant repair", maxsplit=1)[1].split(
-        "## Rotating and losing the provider credential keyring", maxsplit=1
+    repair_section = readme.split("## 9. Same-generation Qdrant repair", maxsplit=1)[1].split(
+        "## 10. Rotating and losing the provider credential keyring", maxsplit=1
     )[0]
     assert "/v1/jobs/${REPAIR_JOB_ID}" in repair_section
 

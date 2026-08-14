@@ -58,6 +58,159 @@ docker compose exec -T api velox-admin admin-key revoke <id>
 
 ---
 
+### 1.1 Minting Admin and Agent keys
+
+To avoid overwriting traps that already exist in your interactive shell, start a dedicated Bash
+subshell first (run `bash`, for example) and complete the creation, import, and cleanup steps
+below in that dedicated session, in order.
+
+After the first start, create an Admin key with the in-container CLI. The response contains a
+one-time token, so write it to a permission-restricted file and move it into a password manager
+immediately, without letting it reach the terminal or a log:
+
+```bash
+cleanup_admin_bootstrap() {
+  local cleanup_file="${ADMIN_BOOTSTRAP_FILE:-}"
+
+  if [[ ! "${cleanup_file}" =~ ^/tmp/velox-admin-created\.[A-Za-z0-9]{6}$ ]]; then
+    return 0
+  fi
+  rm -f -- "${cleanup_file}"
+}
+
+ADMIN_BOOTSTRAP_FILE=$(umask 077 && mktemp "/tmp/velox-admin-created.XXXXXX") || exit 1
+trap cleanup_admin_bootstrap EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+COMPOSE_DISABLE_ENV_FILE=1 docker compose run --rm api velox-admin admin-key create \
+  --name local-admin >"${ADMIN_BOOTSTRAP_FILE}" || exit 1
+```
+
+Once the CLI succeeds the response is still in a file with mode `0600`, and the EXIT/signal
+traps are still armed. Staying in the same dedicated Bash session, import that one-time response
+straight into an approved password manager; do not `cat` it. Only after you have confirmed the
+import, run the separate normal cleanup:
+
+```bash
+cleanup_admin_bootstrap || exit 1
+trap - EXIT HUP INT TERM
+unset ADMIN_BOOTSTRAP_FILE
+```
+
+Exit the dedicated Bash subshell once cleanup is done.
+
+Inspect security metadata, or revoke an Admin key:
+
+```bash
+COMPOSE_DISABLE_ENV_FILE=1 docker compose run --rm api velox-admin admin-key list
+COMPOSE_DISABLE_ENV_FILE=1 docker compose run --rm api velox-admin admin-key revoke <key-id>
+```
+
+A lost Admin token cannot be recovered or shown again. Use the local CLI `list` to find the old
+key id, `revoke` it, and `create` a replacement. When an Agent token is lost, find its security
+record through the Admin API's `GET /v1/admin/api-keys`, revoke it against the latest ETag, then
+create a replacement Agent key; do not leave a valid key you no longer control.
+
+An Admin bearer token is for the admin API only and cannot stand in for an Agent token on the
+KB API. Agent capabilities (`ingest`, `retrieve`, `answer`, `manage`) and KB scope are two
+independent checks; `admin` is not an Agent capability. Unauthorized resources and nonexistent
+resources both return 404, which denies an enumeration side channel.
+
+Inject the tokens from a password manager or an approved secret manager, then create
+configuration files that keep the token out of curl's arguments:
+
+```bash
+cleanup_rag_operations() {
+  local cleanup_dir="${RAG_OPERATIONS_DIR:-}"
+  local cleanup_name
+
+  if [[ ! "${cleanup_dir}" =~ ^/tmp/rag-operations\.[A-Za-z0-9]{6}$ ]]; then
+    return 0
+  fi
+  for cleanup_name in \
+    admin-auth.conf \
+    agent-auth.conf \
+    generation-request.json \
+    generation-response.json \
+    job-response.json \
+    model-profile-request.json \
+    model-profile-response.json \
+    provider-config-request.json \
+    provider-config-response.json \
+    provider-credential-request.json \
+    provider-credential-response.json \
+    retry-response.json \
+    search-request.json \
+    search-response.json \
+    upload-source.markdown \
+    upload-source.md \
+    upload-source.txt \
+    upload-response.json
+  do
+    rm -f -- "${cleanup_dir}/${cleanup_name}"
+  done
+  rmdir -- "${cleanup_dir}"
+}
+
+RAG_OPERATIONS_DIR=$(umask 077 && mktemp -d "/tmp/rag-operations.XXXXXX") || exit 1
+trap cleanup_rag_operations EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+ADMIN_AUTH_CONFIG="${RAG_OPERATIONS_DIR}/admin-auth.conf"
+AGENT_AUTH_CONFIG="${RAG_OPERATIONS_DIR}/agent-auth.conf"
+
+: "${RAG_ADMIN_TOKEN:?inject the Admin token through an approved secret source}"
+python3 - "${ADMIN_AUTH_CONFIG}" <<'PY' || exit 1
+import os
+import pathlib
+import sys
+
+token = os.environ["RAG_ADMIN_TOKEN"]
+if not token or len(token) > 256 or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" for c in token):
+    raise SystemExit(1)
+path = pathlib.Path(sys.argv[1])
+path.write_text(f'header = "Authorization: Bearer {token}"\n', encoding="utf-8")
+path.chmod(0o600)
+PY
+unset RAG_ADMIN_TOKEN
+
+: "${RAG_AGENT_TOKEN:?inject the Agent token through an approved secret source}"
+python3 - "${AGENT_AUTH_CONFIG}" <<'PY' || exit 1
+import os
+import pathlib
+import sys
+
+token = os.environ["RAG_AGENT_TOKEN"]
+if not token or len(token) > 256 or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" for c in token):
+    raise SystemExit(1)
+path = pathlib.Path(sys.argv[1])
+path.write_text(f'header = "Authorization: Bearer {token}"\n', encoding="utf-8")
+path.chmod(0o600)
+PY
+unset RAG_AGENT_TOKEN
+```
+
+Agent keys are created by `POST /v1/admin/api-keys`. That response also contains a one-time
+token; redirect it to a permission-restricted file and import it into a password manager
+immediately. An Agent with the `manage` capability and an initially empty scope receives an
+explicit grant for a KB it creates. Every create uses `Idempotency-Key`; every PATCH uses the
+latest strong ETag with `If-Match`. Each successful modification produces a new ETag, including
+the Agent scope change that follows creating a KB. When updating a KB in sequence, the first
+PATCH uses `<etag-from-create-response>`, the following filter schema PUT uses
+`<etag-from-patch-response>`, and the next operation uses
+`<etag-from-filter-schema-response>`; a missing or stale precondition returns 412. Run the
+existing authenticated metadata smoke:
+
+```bash
+COMPOSE_DISABLE_ENV_FILE=1 make smoke-auth
+```
+
+---
+
+---
+
 ## 2. Three general rules
 
 Violating any one of them gets the request rejected, and the error message will not tell you which
@@ -107,8 +260,7 @@ usually speak only http. `make start` already includes that layer.
 The flow below assumes:
 
 - `ADMIN_AUTH_CONFIG`, `AGENT_AUTH_CONFIG`, and `RAG_OPERATIONS_DIR` are prepared (for how to mint
-  the tokens and write them into permission-restricted config files, see `## Admin and Agent keys`
-  in the README);
+  the tokens and write them into permission-restricted config files, see §1.1 below);
 - the Agent has scope over the target knowledge base and whichever of `manage`/`ingest`/`retrieve`
   the operation needs;
 - `KB_ID` is the UUID of an already created knowledge base;
@@ -875,158 +1027,7 @@ echo "ready: $KB"
 
 ---
 
-## Admin and Agent keys
-
-To avoid overwriting traps that already exist in your interactive shell, start a dedicated Bash
-subshell first (run `bash`, for example) and complete the creation, import, and cleanup steps
-below in that dedicated session, in order.
-
-After the first start, create an Admin key with the in-container CLI. The response contains a
-one-time token, so write it to a permission-restricted file and move it into a password manager
-immediately, without letting it reach the terminal or a log:
-
-```bash
-cleanup_admin_bootstrap() {
-  local cleanup_file="${ADMIN_BOOTSTRAP_FILE:-}"
-
-  if [[ ! "${cleanup_file}" =~ ^/tmp/velox-admin-created\.[A-Za-z0-9]{6}$ ]]; then
-    return 0
-  fi
-  rm -f -- "${cleanup_file}"
-}
-
-ADMIN_BOOTSTRAP_FILE=$(umask 077 && mktemp "/tmp/velox-admin-created.XXXXXX") || exit 1
-trap cleanup_admin_bootstrap EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-COMPOSE_DISABLE_ENV_FILE=1 docker compose run --rm api velox-admin admin-key create \
-  --name local-admin >"${ADMIN_BOOTSTRAP_FILE}" || exit 1
-```
-
-Once the CLI succeeds the response is still in a file with mode `0600`, and the EXIT/signal
-traps are still armed. Staying in the same dedicated Bash session, import that one-time response
-straight into an approved password manager; do not `cat` it. Only after you have confirmed the
-import, run the separate normal cleanup:
-
-```bash
-cleanup_admin_bootstrap || exit 1
-trap - EXIT HUP INT TERM
-unset ADMIN_BOOTSTRAP_FILE
-```
-
-Exit the dedicated Bash subshell once cleanup is done.
-
-Inspect security metadata, or revoke an Admin key:
-
-```bash
-COMPOSE_DISABLE_ENV_FILE=1 docker compose run --rm api velox-admin admin-key list
-COMPOSE_DISABLE_ENV_FILE=1 docker compose run --rm api velox-admin admin-key revoke <key-id>
-```
-
-A lost Admin token cannot be recovered or shown again. Use the local CLI `list` to find the old
-key id, `revoke` it, and `create` a replacement. When an Agent token is lost, find its security
-record through the Admin API's `GET /v1/admin/api-keys`, revoke it against the latest ETag, then
-create a replacement Agent key; do not leave a valid key you no longer control.
-
-An Admin bearer token is for the admin API only and cannot stand in for an Agent token on the
-KB API. Agent capabilities (`ingest`, `retrieve`, `answer`, `manage`) and KB scope are two
-independent checks; `admin` is not an Agent capability. Unauthorized resources and nonexistent
-resources both return 404, which denies an enumeration side channel.
-
-Inject the tokens from a password manager or an approved secret manager, then create
-configuration files that keep the token out of curl's arguments:
-
-```bash
-cleanup_rag_operations() {
-  local cleanup_dir="${RAG_OPERATIONS_DIR:-}"
-  local cleanup_name
-
-  if [[ ! "${cleanup_dir}" =~ ^/tmp/rag-operations\.[A-Za-z0-9]{6}$ ]]; then
-    return 0
-  fi
-  for cleanup_name in \
-    admin-auth.conf \
-    agent-auth.conf \
-    generation-request.json \
-    generation-response.json \
-    job-response.json \
-    model-profile-request.json \
-    model-profile-response.json \
-    provider-config-request.json \
-    provider-config-response.json \
-    provider-credential-request.json \
-    provider-credential-response.json \
-    retry-response.json \
-    search-request.json \
-    search-response.json \
-    upload-source.markdown \
-    upload-source.md \
-    upload-source.txt \
-    upload-response.json
-  do
-    rm -f -- "${cleanup_dir}/${cleanup_name}"
-  done
-  rmdir -- "${cleanup_dir}"
-}
-
-RAG_OPERATIONS_DIR=$(umask 077 && mktemp -d "/tmp/rag-operations.XXXXXX") || exit 1
-trap cleanup_rag_operations EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-ADMIN_AUTH_CONFIG="${RAG_OPERATIONS_DIR}/admin-auth.conf"
-AGENT_AUTH_CONFIG="${RAG_OPERATIONS_DIR}/agent-auth.conf"
-
-: "${RAG_ADMIN_TOKEN:?inject the Admin token through an approved secret source}"
-python3 - "${ADMIN_AUTH_CONFIG}" <<'PY' || exit 1
-import os
-import pathlib
-import sys
-
-token = os.environ["RAG_ADMIN_TOKEN"]
-if not token or len(token) > 256 or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" for c in token):
-    raise SystemExit(1)
-path = pathlib.Path(sys.argv[1])
-path.write_text(f'header = "Authorization: Bearer {token}"\n', encoding="utf-8")
-path.chmod(0o600)
-PY
-unset RAG_ADMIN_TOKEN
-
-: "${RAG_AGENT_TOKEN:?inject the Agent token through an approved secret source}"
-python3 - "${AGENT_AUTH_CONFIG}" <<'PY' || exit 1
-import os
-import pathlib
-import sys
-
-token = os.environ["RAG_AGENT_TOKEN"]
-if not token or len(token) > 256 or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" for c in token):
-    raise SystemExit(1)
-path = pathlib.Path(sys.argv[1])
-path.write_text(f'header = "Authorization: Bearer {token}"\n', encoding="utf-8")
-path.chmod(0o600)
-PY
-unset RAG_AGENT_TOKEN
-```
-
-Agent keys are created by `POST /v1/admin/api-keys`. That response also contains a one-time
-token; redirect it to a permission-restricted file and import it into a password manager
-immediately. An Agent with the `manage` capability and an initially empty scope receives an
-explicit grant for a KB it creates. Every create uses `Idempotency-Key`; every PATCH uses the
-latest strong ETag with `If-Match`. Each successful modification produces a new ETag, including
-the Agent scope change that follows creating a KB. When updating a KB in sequence, the first
-PATCH uses `<etag-from-create-response>`, the following filter schema PUT uses
-`<etag-from-patch-response>`, and the next operation uses
-`<etag-from-filter-schema-response>`; a missing or stale precondition returns 412. Run the
-existing authenticated metadata smoke:
-
-```bash
-COMPOSE_DISABLE_ENV_FILE=1 make smoke-auth
-```
-
----
-
-## Same-generation Qdrant repair
+## 9. Same-generation Qdrant repair
 
 If the active generation's Qdrant collection is gone, or a compatible and verified empty
 collection already exists, you can schedule a `rebuild_generation` job inside the running
@@ -1088,7 +1089,7 @@ recovery within the same vector space, not a cross-profile rebuild or cutover.
 
 ---
 
-## Rotating and losing the provider credential keyring
+## 10. Rotating and losing the provider credential keyring
 
 `RAG_PROVIDER_CREDENTIAL_KEYRING` is a JSON mapping of `key_version -> base64 AES-256 key`, and
 `RAG_PROVIDER_CREDENTIAL_ACTIVE_KEY_VERSION` names the version used for new writes. The API and

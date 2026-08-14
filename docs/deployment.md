@@ -55,7 +55,7 @@ processes must be restarted, or they keep trusting the old CA. The failure prese
 | --- | --- | --- |
 | PostgreSQL | document visibility, jobs, generations, authorization — **the authoritative facts** | everything is lost and cannot be rebuilt from the other components |
 | MinIO | original files, normalized text, chunk manifests | vectors can be rebuilt, the original content cannot |
-| Qdrant | vectors and retrieval payloads | **rebuildable from MinIO + Postgres** (see same-generation repair in the README) |
+| Qdrant | vectors and retrieval payloads | **rebuildable from MinIO + Postgres** (see [same-generation repair](api-operations.md) §9) |
 | Redis | only wakes the worker | no impact; the worker falls back to polling |
 
 So the backup priority is **Postgres > MinIO > Qdrant**. Qdrant is the only one that can be
@@ -79,8 +79,8 @@ it will alert forever. Use `/ready` or `/ready/retrieve`.
 
 ## 5. Four points of no return to know before going live
 
-1. **filter_schema is a one-way door.** It freezes permanently once the first generation is
-   created, and the embedding model, dimension, and distance behave the same way. One field you
+1. **filter_schema, the embedding model, the dimension and the distance freeze with the first
+   generation.** Changing any of them is a cutover, not an edit — see item 2. One field you
    failed to define means creating a new knowledge base and ingesting again — so define every field
    you might ever filter on, before creating that first generation. A field has four elements, and
    `operators` is capped at 4 and constrained by type: keyword and boolean allow only `eq` and `in`,
@@ -101,8 +101,16 @@ it will alert forever. Use `/ready` or `/ready/retrieve`.
    The setup order follows from the door being one-way, and cannot be permuted:
    create knowledge base → `PUT /v1/knowledge-bases/{kb}/filter-schema` → create the initial index
    generation → ingest.
-2. **There is no generation cutover.** Changing the embedding model, the chunk size, or adding
-   sparse all require rebuilding the knowledge base; there is no in-place migration.
+2. **A cutover re-embeds everything, and search is empty while it runs.** Creating a second
+   generation on the same knowledge base swaps to it, enrols the existing documents and queues
+   their backfill in one transaction, so the knowledge base id survives and nothing downstream is
+   reconfigured. What it cannot avoid is the recomputation: every vector is rebuilt, which takes
+   the ingest throughput below multiplied by the chunk count, and the new generation answers with
+   nothing until that finishes. Watch the queued job with `GET /v1/jobs/{job_id}`.
+
+   The retired generation's Qdrant collection is not reclaimed, so each cutover leaves one behind.
+   On a full disk this bites twice: Qdrant fails writes with `No space left on device`, and a
+   Docker build in the same state fails silently rather than loudly.
 3. **A delete is a real delete, and is not recoverable.**
    `DELETE /v1/knowledge-bases/{id}` sets the state to `deleting` and enqueues a
    `purge_knowledge_base` job; the worker then removes that knowledge base's Qdrant collection,
@@ -138,8 +146,9 @@ The numbers below are measured on Apple Silicon and are order-of-magnitude guida
   evaluation over a real corpus, moving from 1200 to 600 lifted answer-hit MRR from 0.631 to 0.836,
   and it is the single largest quality gain available. A CJK corpus can go lower still, because a
   codepoint carries far more information in CJK than in English
-- embedding throughput: about 13.4 chunks/second on a host Ollama with Metal, about 1.2
-  chunks/second on container CPU
+- embedding throughput: 14.20 chunks/second measured on a host Ollama with Metal at batch 8.
+  A containerized model measured 3.10 on the same input and did not improve with batch size,
+  which is why the model runs on the host — see [local-embedding.md](local-embedding.md)
 - reranking sends `min(max(top_k*4, 20), 200)` candidates to the reranker in one call, so the
   **reranker's batch limit must be ≥200 or reranking silently does nothing** — retrieval still
   returns the dense ordering, and the only trace is
