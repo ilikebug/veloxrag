@@ -1,4 +1,4 @@
-.PHONY: build push sync fmt check test test-integration test-integration-core test-acceptance acceptance-ingestion-retrieval coverage verify compose-config build-arm64 up up-provider start stop restart down logs migrate smoke smoke-auth
+.PHONY: build push sync fmt check test test-integration test-integration-core test-acceptance acceptance-ingestion-retrieval acceptance-agent-memory-hooks coverage verify compose-config build-arm64 up up-provider start stop restart down logs migrate smoke smoke-auth
 
 # Local stack knobs used by start/restart.
 # 6379 is frequently occupied by a local or tunneled redis; "auto" picks 6380
@@ -52,6 +52,11 @@ test-acceptance:
 acceptance-ingestion-retrieval:
 	$(MAKE) test-acceptance
 	COMPOSE_DISABLE_ENV_FILE=1 bash scripts/acceptance_ingestion_retrieval.sh
+
+# Records a turn and retrieves it against the running stack, in a throwaway
+# knowledge base. Reports the upload-to-searchable latency.
+acceptance-agent-memory-hooks:
+	bash scripts/acceptance_agent_memory_hooks.sh
 
 coverage:
 	COVERAGE_FILE=$(COMBINED_COVERAGE_FILE) uv run coverage erase
