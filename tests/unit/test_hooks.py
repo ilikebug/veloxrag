@@ -571,3 +571,171 @@ def test_an_unknown_subcommand_is_logged_and_survived(
 
     assert main(["sing"]) == 0
     assert "sing" in (tmp_path / ".veloxrag" / "hook.log").read_text(encoding="utf-8")
+
+
+_RECORD_PAYLOAD: dict[str, object] = {
+    "session_id": "session-1",
+    "prompt_id": "prompt-1",
+    "cwd": "/tmp/project",
+    "last_assistant_message": _LONG_ANSWER,
+}
+
+
+def test_record_uploads_the_paired_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    remember_prompt("session-1", "prompt-1", "why is the schedule per carrier")
+    recorder = _Recorder(httpx.Response(202, json={"job_id": "job-1"}))
+    _install(monkeypatch, recorder)
+
+    code, out = _run(monkeypatch, "record", _RECORD_PAYLOAD, capsys)
+
+    assert code == 0
+    # Stop hook stdout is not context. Printing here would be noise at best.
+    assert out == ""
+    request = recorder.requests[0]
+    assert request.url.path == f"/v1/knowledge-bases/{_KNOWLEDGE_BASE_ID}/documents"
+    body = request.content.decode("utf-8")
+    assert "why is the schedule per carrier" in body
+    assert "The knowledge base refuses a second generation." in body
+    assert '"section": "turn"' in body or '"section":"turn"' in body
+    assert "claude-code-session-1-prompt-1.md" in body
+
+
+def test_record_consumes_the_state_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    remember_prompt("session-1", "prompt-1", "why is the schedule per carrier")
+    _install(monkeypatch, _Recorder(httpx.Response(202, json={"job_id": "job-1"})))
+
+    _run(monkeypatch, "record", _RECORD_PAYLOAD, capsys)
+
+    assert take_prompt("session-1", "prompt-1") is None
+
+
+def test_record_does_nothing_when_the_prompt_was_never_stored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    recorder = _Recorder()
+    _install(monkeypatch, recorder)
+
+    code, _ = _run(monkeypatch, "record", _RECORD_PAYLOAD, capsys)
+
+    assert code == 0
+    assert recorder.requests == []
+
+
+def test_record_drops_a_turn_that_concluded_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    remember_prompt("session-1", "prompt-1", "run the tests")
+    recorder = _Recorder()
+    _install(monkeypatch, recorder)
+
+    code, _ = _run(
+        monkeypatch, "record", {**_RECORD_PAYLOAD, "last_assistant_message": "Done."}, capsys
+    )
+
+    assert code == 0
+    assert recorder.requests == []
+
+
+def test_a_rejected_turn_still_consumes_its_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # take_prompt runs before the threshold check on purpose: a turn that is not
+    # worth recording is finished with, and leaving its question behind would
+    # keep it around until the pruner collects it a day later.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    remember_prompt("session-1", "prompt-1", "run the tests")
+    _install(monkeypatch, _Recorder())
+
+    _run(monkeypatch, "record", {**_RECORD_PAYLOAD, "last_assistant_message": "Done."}, capsys)
+
+    assert take_prompt("session-1", "prompt-1") is None
+
+
+def test_record_treats_a_duplicate_as_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Asking the same question twice and getting the same answer is normal.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    remember_prompt("session-1", "prompt-1", "why is the schedule per carrier")
+    _install(
+        monkeypatch,
+        _Recorder(httpx.Response(409, json={"error": {"code": "DUPLICATE_DOCUMENT"}})),
+    )
+
+    code, _ = _run(monkeypatch, "record", _RECORD_PAYLOAD, capsys)
+
+    assert code == 0
+    assert not (tmp_path / ".veloxrag" / "hook.log").exists()
+
+
+def test_record_never_blocks_the_stop_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Exit 2 on Stop prevents Claude from stopping and loops the session. Every
+    # failure has to come back as 0, and leave a line behind instead.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    remember_prompt("session-1", "prompt-1", "why is the schedule per carrier")
+    _install(monkeypatch, _Recorder(httpx.Response(503, json={"detail": "not ready"})))
+
+    code, _ = _run(monkeypatch, "record", _RECORD_PAYLOAD, capsys)
+
+    assert code == 0
+    logged = (tmp_path / ".veloxrag" / "hook.log").read_text(encoding="utf-8")
+    assert "503" in logged
+
+
+def test_record_survives_the_service_being_unreachable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    remember_prompt("session-1", "prompt-1", "why is the schedule per carrier")
+
+    def explode(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("service down")
+
+    monkeypatch.setattr(
+        "rag_service.dev.hooks.build_client",
+        lambda settings: httpx.Client(
+            base_url=settings.base_url, transport=httpx.MockTransport(explode)
+        ),
+    )
+
+    code, out = _run(monkeypatch, "record", _RECORD_PAYLOAD, capsys)
+
+    assert code == 0
+    assert out == ""
+
+
+def test_record_sends_the_metadata_as_declared_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The filter schema is frozen; a field outside it would be silently
+    # unfilterable, so what actually goes over the wire is worth asserting.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    remember_prompt("session-1", "prompt-1", "why is the schedule per carrier")
+    recorder = _Recorder(httpx.Response(202, json={"job_id": "job-1"}))
+    _install(monkeypatch, recorder)
+
+    _run(monkeypatch, "record", _RECORD_PAYLOAD, capsys)
+
+    body = recorder.requests[0].content.decode("utf-8")
+    for field in ("source_type", "doc_type", "section", "channel", "thread_id"):
+        assert field in body
+    assert "-tmp-project" in body

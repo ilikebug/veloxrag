@@ -478,6 +478,57 @@ def retrieve(payload: dict[str, object], settings: HookSettings) -> str:
     return render_injection(list(results), floor=settings.score_floor)
 
 
+def record(payload: dict[str, object], settings: HookSettings) -> None:
+    """Upload the turn that just finished, or decide it is not worth keeping."""
+    prune_stale_state()
+    session_id = _text(payload, "session_id")
+    prompt_id = _text(payload, "prompt_id")
+    assistant_text = _text(payload, "last_assistant_message")
+    if not session_id or not prompt_id or not assistant_text:
+        return
+    user_input = take_prompt(session_id, prompt_id)
+    if user_input is None:
+        # The question was never stored, so UserPromptSubmit did not run or could
+        # not write. Half a turn is not worth indexing.
+        return
+    if not should_record(user_input, assistant_text, minimum=settings.minimum_answer_characters):
+        return
+    cwd = _text(payload, "cwd")
+    channel = channel_for(cwd)
+    occurred_at = datetime.now(UTC).isoformat()
+    body = render_turn(
+        user_input=user_input,
+        assistant_text=assistant_text,
+        channel=channel,
+        session_id=session_id,
+        occurred_at=occurred_at,
+    )
+    metadata = build_turn_metadata(
+        user_input=user_input,
+        assistant_text=assistant_text,
+        channel=channel,
+        cwd=cwd,
+        session_id=session_id,
+        occurred_at=occurred_at,
+    )
+    display_name = f"claude-code-{session_id}-{prompt_id}.md"
+    with build_client(settings) as client:
+        knowledge_base_id = resolve_knowledge_base(settings, client)
+        if knowledge_base_id is None:
+            _log("record found no single knowledge base; set VELOX_HOOK_KNOWLEDGE_BASE")
+            return
+        response = client.post(
+            f"/v1/knowledge-bases/{knowledge_base_id}/documents",
+            files={"file": (display_name, body.encode("utf-8"), "text/markdown")},
+            data={"display_name": display_name, "metadata": json.dumps(metadata)},
+        )
+    # 202 is the upload accepted and a job queued; the job is not awaited, since
+    # the worker owns it and the hook has a session to get out of the way of.
+    # 409 is the same content already indexed, which is a success for our purpose.
+    if response.status_code not in {202, 409}:
+        _log(f"record upload failed with {response.status_code}")
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     subcommand = arguments[0] if arguments else ""
@@ -488,6 +539,8 @@ def main(argv: list[str] | None = None) -> int:
             rendered = retrieve(payload, settings)
             if rendered:
                 print(rendered, flush=True)
+        elif subcommand == "record":
+            record(payload, settings)
         else:
             _log(f"unknown subcommand: {subcommand!r}")
     except Exception as error:  # noqa: BLE001 - a hook must not fail the session
@@ -502,6 +555,7 @@ __all__ = [
     "channel_for",
     "main",
     "prune_stale_state",
+    "record",
     "remember_prompt",
     "render_injection",
     "render_turn",
