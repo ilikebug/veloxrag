@@ -36,6 +36,7 @@ velox-provider-stub = "rag_service.dev.provider_stub:main"
 velox-provider-stub-tls = "rag_service.dev.provider_stub_tls:main"
 velox-minio-init = "rag_service.dev.minio_init:main"
 velox-chat-transcripts = "rag_service.dev.chat_transcripts:main"
+velox-hook = "rag_service.dev.hooks:main"
 velox-mcp = "rag_service.mcp.server:main"
 velox-bootstrap = "rag_service.dev.bootstrap:main"
 

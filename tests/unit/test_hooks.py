@@ -4,6 +4,7 @@ import io
 import json
 import os
 import stat
+import tomllib
 from pathlib import Path
 
 import httpx
@@ -739,3 +740,14 @@ def test_record_sends_the_metadata_as_declared_fields(
     for field in ("source_type", "doc_type", "section", "channel", "thread_id"):
         assert field in body
     assert "-tmp-project" in body
+
+
+def test_the_console_script_points_at_this_module() -> None:
+    # The hook is configured in settings.json as `uvx ... velox-hook`, so the
+    # entry point is the whole interface. A rename here is a broken hook there,
+    # with nothing to say why.
+    manifest = tomllib.loads(
+        (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+
+    assert manifest["project"]["scripts"]["velox-hook"] == "rag_service.dev.hooks:main"
