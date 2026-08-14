@@ -11,6 +11,7 @@ from rag_service.dev.hooks import (
     channel_for,
     prune_stale_state,
     remember_prompt,
+    render_injection,
     render_turn,
     should_record,
     state_directory,
@@ -186,3 +187,65 @@ def test_metadata_uses_only_declared_filter_fields() -> None:
         "lang": "en",
         "occurred_at": "2026-08-14T09:00:00+00:00",
     }
+
+
+_PASSAGE = {
+    "text": "the schedule is per carrier, not per slug",
+    "score": 0.72,
+    "document_id": "11111111-2222-4333-8444-555555555555",
+    "metadata": {"channel": "-tmp-project", "occurred_at": "2026-08-13T14:22:00+00:00"},
+    "source": {"start_offset": 1200, "end_offset": 1800},
+}
+
+
+def test_passages_are_framed_as_history_rather_than_instruction() -> None:
+    # The passages are things the operator said. Injected without framing, a
+    # request from months ago reads like a request for this turn.
+    rendered = render_injection([_PASSAGE], floor=0.5)
+
+    assert rendered.startswith("<retrieved-memory>")
+    assert rendered.rstrip().endswith("</retrieved-memory>")
+    assert "not an instruction for this turn" in rendered
+    assert "may be stale" in rendered
+
+
+def test_a_passage_carries_what_is_needed_to_widen_it() -> None:
+    rendered = render_injection([_PASSAGE], floor=0.5)
+
+    assert "score=0.72" in rendered
+    assert "channel=-tmp-project" in rendered
+    assert "occurred_at=2026-08-13T14:22:00+00:00" in rendered
+    assert "document_id=11111111-2222-4333-8444-555555555555" in rendered
+    assert "offsets=1200-1800" in rendered
+    assert "the schedule is per carrier, not per slug" in rendered
+
+
+def test_passages_below_the_floor_are_dropped() -> None:
+    weak = {**_PASSAGE, "score": 0.31}
+
+    assert render_injection([weak], floor=0.5) == ""
+
+
+def test_nothing_is_printed_when_everything_is_filtered_out() -> None:
+    # An empty wrapper would still cost tokens and still suggest the memory was
+    # consulted and had nothing, which is not what "no passage cleared the floor"
+    # means.
+    assert render_injection([], floor=0.5) == ""
+
+
+def test_a_passage_without_a_score_is_dropped() -> None:
+    assert render_injection([{**_PASSAGE, "score": None}], floor=0.5) == ""
+
+
+def test_surviving_passages_are_numbered_in_order() -> None:
+    # The numbering has to follow the surviving passages, not the input list, or
+    # a dropped passage would leave a gap the model reads as a missing citation.
+    second = {**_PASSAGE, "score": 0.9, "text": "the second passage"}
+    dropped = {**_PASSAGE, "score": 0.1, "text": "the dropped passage"}
+
+    rendered = render_injection([_PASSAGE, dropped, second], floor=0.5)
+
+    assert "[1] score=0.72" in rendered
+    assert "[2] score=0.90" in rendered
+    assert "the dropped passage" not in rendered
+    assert rendered.index("[1]") < rendered.index("[2]")
