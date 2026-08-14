@@ -1,7 +1,7 @@
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Never, cast
+from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -19,6 +19,7 @@ from rag_service.auth.policies import (
     Capability,
     require_capability,
     require_document_read,
+    require_raw_file_read,
 )
 from rag_service.config import Settings
 from rag_service.db.models.auth import ApiKey, AuditEvent, IdempotencyRecord
@@ -28,6 +29,7 @@ from rag_service.db.models.knowledge_bases import (
     KnowledgeBaseIndexGeneration,
     KnowledgeBaseMutation,
 )
+from rag_service.ingestion.artifacts import parsed_text_object_key
 from rag_service.metadata.document_repositories import (
     DocumentMetadataRepository,
     DocumentRecord,
@@ -39,6 +41,7 @@ from rag_service.metadata.knowledge_base_repositories import (
     sqlalchemy_knowledge_base_repositories,
 )
 from rag_service.metadata.schemas import (
+    DocumentContent,
     DocumentPage,
     DocumentStatus,
     DocumentVersionPage,
@@ -59,6 +62,18 @@ from rag_service.metadata.schemas import (
 )
 
 type RepositoryFactory = Callable[[AsyncSession], KnowledgeBaseRepositories]
+
+
+class DocumentContentStore(Protocol):
+    async def read_bytes(
+        self,
+        object_key: str,
+        *,
+        expected_checksum: str,
+        max_bytes: int,
+    ) -> bytes: ...
+
+
 type DocumentRepositoryFactory = Callable[[AsyncSession], DocumentMetadataRepository]
 type Clock = Callable[[], datetime]
 
@@ -857,10 +872,14 @@ class DocumentMetadataService:
         session: AsyncSession,
         settings: Settings,
         repository_factory: DocumentRepositoryFactory = sqlalchemy_document_metadata_repository,
+        object_store: DocumentContentStore | None = None,
     ) -> None:
         self._session = session
         self._settings = settings
         self._repository_factory = repository_factory
+        # Only the content read needs it, so it stays optional: every other
+        # caller of this service constructs it without a store.
+        self._object_store = object_store
 
     def _page_parameters(
         self,
@@ -1109,4 +1128,101 @@ class DocumentMetadataService:
             parent_id = None
             rows = []
             visible = []
+            _reraise_redacted_base_exception(error)
+
+    async def read_document_content(
+        self,
+        document_id: UUID,
+        *,
+        actor: AgentPrincipal,
+        start_offset: int,
+        end_offset: int,
+    ) -> DocumentContent:
+        """Return a slice of the document's normalized text by codepoint offsets.
+
+        The whole object is fetched and sliced in memory rather than range-read
+        from storage, because read_bytes verifies the object against its recorded
+        checksum end to end and a ranged read cannot. Documents are bounded by the
+        upload limit, so the cost is bounded too; if that stops holding, the
+        replacement needs its own integrity story rather than dropping this one.
+        """
+
+        identifier: UUID | None = None
+        repository: DocumentMetadataRepository | None = None
+        row: DocumentRecord | None = None
+        version: DocumentVersionRecord | None = None
+        payload = b""
+        text = ""
+        try:
+            identifier = _require_uuid(document_id)
+            if (
+                type(start_offset) is not int
+                or type(end_offset) is not int
+                or start_offset < 0
+                or end_offset < start_offset
+            ):
+                raise _validation_error()
+            store = self._object_store
+            if store is None:
+                raise _internal_error()
+            repository = self._repository_factory(self._session)
+            row = await repository.get_document(actor.key_id, identifier)
+            if row is None:
+                raise _not_found_error()
+            require_raw_file_read(
+                actor,
+                row.knowledge_base_id,
+                parent_knowledge_base_exists=True,
+            )
+            version = await repository.get_current_version(actor.key_id, identifier)
+            if version is None or version.parsed_object_checksum_sha256 is None:
+                # No active version yet: the document exists but has no text to
+                # serve. A conflict rather than a 404, because the document is
+                # visible and this is a state the caller can wait out.
+                raise _state_conflict_error()
+            payload = await store.read_bytes(
+                parsed_text_object_key(row.knowledge_base_id, row.id, version.id),
+                expected_checksum=version.parsed_object_checksum_sha256,
+                max_bytes=self._settings.max_upload_bytes,
+            )
+            text = payload.decode("utf-8", errors="strict")
+            # Clamped, not rejected: a caller widening around a hit near the end
+            # of a document should get what exists rather than an error.
+            total = len(text)
+            begin = min(start_offset, total)
+            finish = min(end_offset, total)
+            return DocumentContent(
+                document_id=row.id,
+                version_id=version.id,
+                start_offset=begin,
+                end_offset=finish,
+                total_codepoints=total,
+                text=text[begin:finish],
+            )
+        except BusinessError as error:
+            document_id = UUID(int=0)
+            identifier = None
+            repository = None
+            row = None
+            version = None
+            payload = b""
+            text = ""
+            _raise_sanitized_business_error(error)
+        except Exception as error:
+            document_id = UUID(int=0)
+            identifier = None
+            repository = None
+            row = None
+            version = None
+            payload = b""
+            text = ""
+            _raise_internal(error)
+        except BaseException as error:
+            document_id = UUID(int=0)
+            identifier = None
+            repository = None
+            row = None
+            version = None
+            payload = b""
+            text = ""
             _reraise_redacted_base_exception(error)

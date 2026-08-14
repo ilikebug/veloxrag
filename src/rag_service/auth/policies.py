@@ -249,3 +249,28 @@ def require_document_read(
     if not any(_has_capability(agent, capability) for capability in _DOCUMENT_READ_CAPABILITIES):
         raise _insufficient_capability_error()
     return agent
+
+
+def require_raw_file_read(
+    principal: Principal,
+    parent_knowledge_base_id: UUID,
+    *,
+    parent_knowledge_base_exists: bool,
+) -> AgentPrincipal:
+    """Gate on reading a document's own text, over and above reading its metadata.
+
+    raw_file_read is a per-key flag rather than a capability because it cuts
+    across them: a key may legitimately search a knowledge base while not being
+    trusted with the source text behind a hit. So both checks apply, and the
+    flag is checked second — a key outside the scope must not be able to tell
+    the two refusals apart.
+    """
+
+    agent = require_document_read(
+        principal,
+        parent_knowledge_base_id,
+        parent_knowledge_base_exists=parent_knowledge_base_exists,
+    )
+    if agent.raw_file_read is not True:
+        raise _insufficient_capability_error()
+    return agent

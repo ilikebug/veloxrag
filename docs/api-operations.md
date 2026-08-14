@@ -6,7 +6,7 @@ authoritative guide to operating it.
 The complete machine-readable contract comes from the service itself. **Prefer it** — it is
 generated from the code and cannot go stale:
 
-- `GET /openapi.json` — all 39 operations with request/response schemas (feed this one to an AI)
+- `GET /openapi.json` — all 40 operations with request/response schemas (feed this one to an AI)
 - `GET /docs` — Swagger UI, interactive (frontend assets come from a CDN, so it needs network)
 - `GET /redoc` — ReDoc
 
@@ -686,6 +686,30 @@ trap - EXIT HUP INT TERM
 unset ADMIN_AUTH_CONFIG AGENT_AUTH_CONFIG DOCUMENT_NAME DOCUMENT_ROOT RAG_OPERATIONS_DIR
 unset STAGED_DOCUMENT_MIME STAGED_DOCUMENT_PATH
 ```
+
+---
+
+### 8. Content: read a range of a document's text
+
+A search result identifies a chunk, and the answer it was chosen for often continues past that
+chunk's boundary. The offsets on a result address the document's normalized text directly, so
+widening a hit is one more call:
+
+```bash
+curl -sS --config "${AGENT_AUTH_CONFIG}" \
+  "${RAG_BASE_URL}/v1/documents/${DOCUMENT_ID}/content?start=0&end=800"
+```
+
+`start` defaults to 0 and `end` to the upload limit, and both are clamped to the document rather
+than rejected, so widening around a hit near either end returns what exists. `total_codepoints`
+in the response distinguishes a clamped range from an exhausted one, and `version_id` records
+which version was read — the endpoint serves the document's current version only, and returns
+409 `RESOURCE_STATE_CONFLICT` while a document has no active version yet.
+
+This is the one endpoint gated on `raw_file_read`, which is a per-key flag rather than a
+capability because it cuts across them: a key may legitimately search a knowledge base while not
+being trusted with the source text behind a hit. Scope is checked before the flag, so a key
+outside the scope cannot tell the two refusals apart.
 
 ---
 

@@ -1,7 +1,7 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +15,7 @@ from rag_service.config import Settings, get_settings
 from rag_service.db.dependencies import get_session
 from rag_service.metadata.knowledge_base_routes import _page_limit
 from rag_service.metadata.schemas import (
+    DocumentContent,
     DocumentPage,
     DocumentVersionPage,
     SafeDocument,
@@ -106,3 +107,40 @@ async def list_document_versions(
         limit=_page_limit(limit, settings),
     )
     return _safe_response(page)
+
+
+@router.get(
+    "/documents/{document_id}/content",
+    response_model=DocumentContent,
+    responses=error_responses(401, 403, 404, 409, 422, 500),
+)
+async def read_document_content(
+    request: Request,
+    document_id: UUID,
+    _request_id: Annotated[str, Depends(get_request_id)],
+    actor: Annotated[AgentPrincipal, Depends(require_agent_principal)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    start: Annotated[int, Query(ge=0)] = 0,
+    end: Annotated[int | None, Query(ge=0)] = None,
+) -> JSONResponse:
+    """Read a range of a document's normalized text.
+
+    The offsets are the ones a search result already carries, so a consumer that
+    got a truncated hit can widen it without a second addressing scheme. `end`
+    defaults to the upload limit rather than to the document length, which is not
+    known until the object is read.
+    """
+
+    service = DocumentMetadataService(
+        session=session,
+        settings=settings,
+        object_store=request.app.state.upload_object_store,
+    )
+    content = await service.read_document_content(
+        document_id,
+        actor=actor,
+        start_offset=start,
+        end_offset=settings.max_upload_bytes if end is None else end,
+    )
+    return _safe_response(content)

@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
@@ -16,6 +16,7 @@ from rag_service.auth.policies import (
     require_capability,
     require_document_read,
     require_knowledge_base_access,
+    require_raw_file_read,
 )
 from rag_service.db.models.auth import ApiKey
 
@@ -680,3 +681,54 @@ def test_document_read_does_not_treat_admin_as_an_agent_policy_bypass() -> None:
         "INSUFFICIENT_CAPABILITY",
         "Insufficient capability",
     )
+
+
+def _raw_reader(*capabilities: Capability) -> AgentPrincipal:
+    base = _agent(*capabilities)
+    return replace(base, raw_file_read=True)
+
+
+def test_raw_file_read_needs_both_document_read_and_the_flag() -> None:
+    """The flag is deliberately not a capability: it cuts across them.
+
+    A key can be entitled to search a knowledge base and still not be trusted
+    with the source text behind a hit, so both checks have to pass.
+    """
+
+    granted = require_raw_file_read(
+        _raw_reader(Capability.RETRIEVE),
+        KB_ID,
+        parent_knowledge_base_exists=True,
+    )
+    assert granted.raw_file_read is True
+
+    # Capability without the flag.
+    with pytest.raises(BusinessError) as denied_flag:
+        require_raw_file_read(
+            _agent(Capability.RETRIEVE),
+            KB_ID,
+            parent_knowledge_base_exists=True,
+        )
+    assert denied_flag.value.status_code == 403
+
+    # Flag without any document-read capability.
+    with pytest.raises(BusinessError) as denied_capability:
+        require_raw_file_read(
+            _raw_reader(),
+            KB_ID,
+            parent_knowledge_base_exists=True,
+        )
+    assert denied_capability.value.status_code == 403
+
+
+def test_raw_file_read_outside_scope_is_indistinguishable_from_absent() -> None:
+    """Scope is checked before the flag, so a key outside scope cannot use the
+    difference between 403 and 404 to learn that a knowledge base exists."""
+
+    with pytest.raises(BusinessError) as error:
+        require_raw_file_read(
+            replace(_raw_reader(Capability.RETRIEVE), knowledge_base_ids=frozenset()),
+            KB_ID,
+            parent_knowledge_base_exists=True,
+        )
+    assert error.value.status_code == 404

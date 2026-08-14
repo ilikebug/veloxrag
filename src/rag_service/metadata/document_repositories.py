@@ -86,6 +86,12 @@ class DocumentMetadataRepository(Protocol):
         limit: int,
     ) -> list[DocumentVersionRecord]: ...
 
+    async def get_current_version(
+        self,
+        actor_key_id: UUID,
+        document_id: UUID,
+    ) -> DocumentVersionRecord | None: ...
+
 
 _DOCUMENT_COLUMNS = (
     Document.id.label("id"),
@@ -274,6 +280,37 @@ class SqlAlchemyDocumentMetadataRepository:
             )
         statement = statement.order_by(DocumentVersion.created_at, DocumentVersion.id).limit(limit)
         return [_version_record(row) for row in (await self._session.execute(statement)).all()]
+
+    async def get_current_version(
+        self,
+        actor_key_id: UUID,
+        document_id: UUID,
+    ) -> DocumentVersionRecord | None:
+        # Joined through the same scope as every other document read, and matched
+        # against the document's own current_version_id rather than taking the
+        # newest row: a version that is still being processed must not be served
+        # as the document's content.
+        statement = (
+            select(*_VERSION_COLUMNS)
+            .select_from(DocumentVersion)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+            .join(
+                ApiKeyKnowledgeBaseScope,
+                and_(
+                    ApiKeyKnowledgeBaseScope.knowledge_base_id == KnowledgeBase.id,
+                    ApiKeyKnowledgeBaseScope.api_key_id == actor_key_id,
+                ),
+            )
+            .where(
+                Document.id == document_id,
+                Document.deleted_at.is_(None),
+                KnowledgeBase.status != "deleting",
+                DocumentVersion.id == Document.current_version_id,
+            )
+        )
+        row = (await self._session.execute(statement)).one_or_none()
+        return None if row is None else _version_record(row)
 
 
 def sqlalchemy_document_metadata_repository(

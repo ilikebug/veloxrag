@@ -412,3 +412,19 @@ def _canonical_create_payload(command: KnowledgeBaseCreate) -> bytes:
 
 def knowledge_base_create_fingerprint(command: KnowledgeBaseCreate) -> bytes:
     return hashlib.sha256(_canonical_create_payload(command)).digest()
+
+
+class DocumentContent(_Schema):
+    """A slice of a document's normalized text, addressed by codepoint offsets.
+
+    The offsets are the same ones a search result carries, so a consumer can take
+    a hit and widen it without a second addressing scheme. `total_codepoints`
+    lets the caller tell a clamped range from an exhausted one.
+    """
+
+    document_id: UUID
+    version_id: UUID
+    start_offset: int = Field(ge=0)
+    end_offset: int = Field(ge=0)
+    total_codepoints: int = Field(ge=0)
+    text: str

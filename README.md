@@ -236,7 +236,7 @@ from the service itself** (generated from the code, so it cannot go stale):
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /openapi.json` | All 39 operations and their schemas. Point an AI or a tool at this one |
+| `GET /openapi.json` | All 40 operations and their schemas. Point an AI or a tool at this one |
 | `GET /docs` | Swagger UI, interactive (frontend assets come from a CDN, so it needs network) |
 | `GET /redoc` | ReDoc |
 
@@ -246,6 +246,17 @@ return are in [docs/deployment.md](docs/deployment.md)**.
 
 To use it as a memory layer for local agents such as Claude Code over MCP, see
 [Agent memory over MCP](#agent-memory-over-mcp) below and [docs/mcp.md](docs/mcp.md).
+
+A search hit is a chunk, and the answer often sits just past its edge. Every result carries
+`source.start_offset` / `source.end_offset`, and `GET /v1/documents/{id}/content?start=&end=`
+reads that range back out of the document's normalized text, so a consumer can widen a hit
+without a second addressing scheme. Measured over 70 chat-transcript queries, widening a hit by
+300 characters moved answer-level MRR from 0.675 to 0.756 and took @5 and @10 to 1.00 — the
+answer was almost always already adjacent to a retrieved chunk, just outside it. Offsets past
+the end of the document are clamped rather than rejected, and `total_codepoints` tells a clamped
+range from an exhausted one. The endpoint needs a key with `raw_file_read`, which is separate
+from the capabilities: a key may be entitled to search a knowledge base without being trusted
+with the source text behind a hit.
 
 Reranking is supported: set `rerank_profile_id` on the knowledge base
 (`PATCH /v1/knowledge-bases/{id}`) and pass `"rerank": true` on the search. On a 70-query
