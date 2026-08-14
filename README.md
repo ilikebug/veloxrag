@@ -118,6 +118,11 @@ needed; all three exist for departing from the defaults:
 More detail, including why two compose defaults hold only locally, is in
 [docs/mcp.md](docs/mcp.md).
 
+Connecting the MCP server only gives the agent tools to search memory; nothing writes to it, and
+searching is left to the agent's own discretion. `velox-hook` is a separate pair of Claude Code
+hooks that records every turn and searches on every prompt automatically — off until you add them,
+and independent of the MCP connection above. See [docs/agent-memory.md](docs/agent-memory.md).
+
 ## Retrieval
 
 **Relevance judgement is left to the agent, not done by a reranker.** An agent already reads the
