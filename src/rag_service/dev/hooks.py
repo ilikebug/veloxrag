@@ -29,6 +29,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Final
 
+import httpx
+
 from rag_service.dev.chat_transcripts import _demote_headings, _language_of, redact
 
 _STATE_TTL_SECONDS: Final = 24 * 60 * 60
@@ -37,6 +39,24 @@ _STATE_FILE_MODE: Final = 0o600
 # some short but valuable answers; that is the accepted cost of not spending a
 # model call per turn to decide. Override with VELOX_HOOK_MIN_ANSWER_CHARACTERS.
 _DEFAULT_MIN_ANSWER_CHARACTERS: Final = 200
+_DEFAULT_BASE_URL: Final = "http://127.0.0.1:8000"
+_HTTP_TIMEOUT_SECONDS: Final = 8.0
+_DEFAULT_SCORE_FLOOR: Final = 0.5
+_DEFAULT_TOP_K: Final = 5
+# The scores compared against the floor are cosine similarity, so anything
+# outside 0..1 would admit either everything or nothing.
+_MIN_SCORE_FLOOR: Final = 0.0
+_MAX_SCORE_FLOOR: Final = 1.0
+# A negative floor would disable should_record's threshold entirely.
+_MIN_ANSWER_CHARACTERS: Final = 0
+# The search endpoint's own documented range; outside it every request would be
+# rejected with a 422, and retrieve fails silently by design, so nothing would
+# tell the user why retrieval simply stopped working.
+_MIN_TOP_K: Final = 1
+_MAX_TOP_K: Final = 50
+# The API's own query limit. A longer prompt is truncated rather than refused:
+# the first 8000 codepoints of a long question still retrieve something useful.
+_MAX_QUERY_CODEPOINTS: Final = 8000
 
 _INJECTION_PREAMBLE: Final = (
     "Passages below were retrieved from your own past sessions. They may be "
@@ -281,13 +301,126 @@ def render_injection(passages: list[dict[str, object]], *, floor: float) -> str:
     return "\n".join(("<retrieved-memory>", _INJECTION_PREAMBLE, "", *lines, "</retrieved-memory>"))
 
 
+def _float_or(
+    environ: dict[str, str],
+    name: str,
+    fallback: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    try:
+        value = float(environ[name])
+    except (KeyError, ValueError):
+        return fallback
+    # A value that parses but is out of range is the same problem as one that
+    # does not parse at all: falling back to the default beats clamping, which
+    # would silently honour half of a wrong value.
+    if (minimum is not None and value < minimum) or (maximum is not None and value > maximum):
+        return fallback
+    return value
+
+
+def _int_or(
+    environ: dict[str, str],
+    name: str,
+    fallback: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    try:
+        value = int(environ[name])
+    except (KeyError, ValueError):
+        return fallback
+    if (minimum is not None and value < minimum) or (maximum is not None and value > maximum):
+        return fallback
+    return value
+
+
+class HookSettings:
+    """Everything tunable, read from the environment, never failing.
+
+    No value here is worth refusing to run over: the fallback is the documented
+    default, and a hook that exits with a configuration complaint would print it
+    on every prompt.
+    """
+
+    __slots__ = (
+        "base_url",
+        "knowledge_base_id",
+        "minimum_answer_characters",
+        "score_floor",
+        "token",
+        "top_k",
+    )
+
+    def __init__(self, environ: dict[str, str]) -> None:
+        base_url = environ.get("VELOX_HOOK_BASE_URL", _DEFAULT_BASE_URL).rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            base_url = _DEFAULT_BASE_URL
+        self.base_url = base_url
+        self.token = environ.get("VELOX_HOOK_TOKEN", "").strip()
+        self.knowledge_base_id = environ.get("VELOX_HOOK_KNOWLEDGE_BASE", "").strip() or None
+        self.score_floor = _float_or(
+            environ,
+            "VELOX_HOOK_SCORE_FLOOR",
+            _DEFAULT_SCORE_FLOOR,
+            minimum=_MIN_SCORE_FLOOR,
+            maximum=_MAX_SCORE_FLOOR,
+        )
+        self.minimum_answer_characters = _int_or(
+            environ,
+            "VELOX_HOOK_MIN_ANSWER_CHARACTERS",
+            _DEFAULT_MIN_ANSWER_CHARACTERS,
+            minimum=_MIN_ANSWER_CHARACTERS,
+        )
+        self.top_k = _int_or(
+            environ, "VELOX_HOOK_TOP_K", _DEFAULT_TOP_K, minimum=_MIN_TOP_K, maximum=_MAX_TOP_K
+        )
+
+
+def build_client(settings: HookSettings) -> httpx.Client:
+    # No Authorization header at all when no token is configured: the service's
+    # local-trusted mode only applies to requests that carry no credential, so an
+    # empty bearer would be rejected rather than falling through.
+    headers = {"Authorization": f"Bearer {settings.token}"} if settings.token else {}
+    return httpx.Client(
+        base_url=settings.base_url,
+        headers=headers,
+        timeout=_HTTP_TIMEOUT_SECONDS,
+    )
+
+
+def resolve_knowledge_base(settings: HookSettings, client: httpx.Client) -> str | None:
+    """Find the knowledge base when none was named.
+
+    Unambiguous only when there is exactly one. With several, returning None
+    disables the hook for this invocation, which is better than searching or
+    writing to the wrong memory.
+    """
+    if settings.knowledge_base_id is not None:
+        return settings.knowledge_base_id
+    response = client.get("/v1/knowledge-bases")
+    if response.status_code != 200:
+        return None
+    items = response.json().get("items", ())
+    if len(items) != 1:
+        return None
+    identifier = items[0].get("id")
+    return None if identifier is None else str(identifier)
+
+
 __all__ = [
+    "HookSettings",
+    "build_client",
     "build_turn_metadata",
     "channel_for",
     "prune_stale_state",
     "remember_prompt",
     "render_injection",
     "render_turn",
+    "resolve_knowledge_base",
     "should_record",
     "state_directory",
     "take_prompt",

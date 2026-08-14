@@ -4,19 +4,25 @@ import os
 import stat
 from pathlib import Path
 
+import httpx
 import pytest
 
 from rag_service.dev.hooks import (
+    HookSettings,
+    build_client,
     build_turn_metadata,
     channel_for,
     prune_stale_state,
     remember_prompt,
     render_injection,
     render_turn,
+    resolve_knowledge_base,
     should_record,
     state_directory,
     take_prompt,
 )
+
+_KNOWLEDGE_BASE_ID = "1d196c08-303a-4d5c-89b0-235dfe8fc8fc"
 
 
 def test_channel_matches_the_directory_name_claude_code_assigns(
@@ -249,3 +255,142 @@ def test_surviving_passages_are_numbered_in_order() -> None:
     assert "[2] score=0.90" in rendered
     assert "the dropped passage" not in rendered
     assert rendered.index("[1]") < rendered.index("[2]")
+
+
+def test_settings_need_no_environment_at_all() -> None:
+    settings = HookSettings({})
+
+    assert settings.base_url == "http://127.0.0.1:8000"
+    assert settings.knowledge_base_id is None
+    assert settings.score_floor == 0.5
+    assert settings.minimum_answer_characters == 200
+    assert settings.top_k == 5
+
+
+def test_settings_read_the_tunable_values() -> None:
+    settings = HookSettings(
+        {
+            "VELOX_HOOK_BASE_URL": "http://127.0.0.1:9000/",
+            "VELOX_HOOK_KNOWLEDGE_BASE": _KNOWLEDGE_BASE_ID,
+            "VELOX_HOOK_SCORE_FLOOR": "0.62",
+            "VELOX_HOOK_MIN_ANSWER_CHARACTERS": "80",
+            "VELOX_HOOK_TOP_K": "8",
+        }
+    )
+
+    assert settings.base_url == "http://127.0.0.1:9000"
+    assert settings.knowledge_base_id == _KNOWLEDGE_BASE_ID
+    assert settings.score_floor == 0.62
+    assert settings.minimum_answer_characters == 80
+    assert settings.top_k == 8
+
+
+def test_an_unusable_value_falls_back_instead_of_failing() -> None:
+    # A hook that refused to start over a bad float would take the session's
+    # memory away and say so on every prompt. The default is the safer answer.
+    settings = HookSettings({"VELOX_HOOK_SCORE_FLOOR": "high", "VELOX_HOOK_TOP_K": ""})
+
+    assert settings.score_floor == 0.5
+    assert settings.top_k == 5
+
+
+def test_a_base_url_that_is_not_http_falls_back() -> None:
+    settings = HookSettings({"VELOX_HOOK_BASE_URL": "ftp://elsewhere"})
+
+    assert settings.base_url == "http://127.0.0.1:8000"
+
+
+def test_a_value_outside_its_usable_range_falls_back() -> None:
+    # A parseable but unusable value is the same problem as an unparseable one: a
+    # typo should cost the default, never a silently dead hook. top_k=0 would make
+    # every search a 422, and retrieve fails silently by design.
+    settings = HookSettings(
+        {
+            "VELOX_HOOK_TOP_K": "0",
+            "VELOX_HOOK_MIN_ANSWER_CHARACTERS": "-5",
+            "VELOX_HOOK_SCORE_FLOOR": "1.4",
+        }
+    )
+
+    assert settings.top_k == 5
+    assert settings.minimum_answer_characters == 200
+    assert settings.score_floor == 0.5
+
+
+def test_a_top_k_above_the_search_endpoints_range_falls_back() -> None:
+    # 50 is the endpoint's own documented ceiling; one past it would be rejected.
+    settings = HookSettings({"VELOX_HOOK_TOP_K": "51"})
+
+    assert settings.top_k == 5
+
+
+def test_boundary_values_are_accepted_rather_than_treated_as_out_of_range() -> None:
+    # The bounds themselves are legitimate settings, not values to reject.
+    low = HookSettings(
+        {
+            "VELOX_HOOK_TOP_K": "1",
+            "VELOX_HOOK_MIN_ANSWER_CHARACTERS": "0",
+            "VELOX_HOOK_SCORE_FLOOR": "0.0",
+        }
+    )
+    high = HookSettings({"VELOX_HOOK_TOP_K": "50", "VELOX_HOOK_SCORE_FLOOR": "1.0"})
+
+    assert low.top_k == 1
+    assert low.minimum_answer_characters == 0
+    assert low.score_floor == 0.0
+    assert high.top_k == 50
+    assert high.score_floor == 1.0
+
+
+def test_a_single_knowledge_base_is_resolved_without_configuration() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": [{"id": _KNOWLEDGE_BASE_ID}]})
+
+    client = httpx.Client(base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(handle))
+
+    assert resolve_knowledge_base(HookSettings({}), client) == _KNOWLEDGE_BASE_ID
+
+
+def test_several_knowledge_bases_are_not_guessed_between() -> None:
+    # Guessing would silently search the wrong memory. The operator names one
+    # with VELOX_HOOK_KNOWLEDGE_BASE.
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": [{"id": _KNOWLEDGE_BASE_ID}, {"id": "other"}]})
+
+    client = httpx.Client(base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(handle))
+
+    assert resolve_knowledge_base(HookSettings({}), client) is None
+
+
+def test_a_configured_knowledge_base_is_not_looked_up() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be made")
+
+    client = httpx.Client(base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(handle))
+    settings = HookSettings({"VELOX_HOOK_KNOWLEDGE_BASE": _KNOWLEDGE_BASE_ID})
+
+    assert resolve_knowledge_base(settings, client) == _KNOWLEDGE_BASE_ID
+
+
+def test_an_error_listing_knowledge_bases_resolves_to_nothing() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"detail": "not ready"})
+
+    client = httpx.Client(base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(handle))
+
+    assert resolve_knowledge_base(HookSettings({}), client) is None
+
+
+def test_no_authorization_header_is_sent_when_no_token_is_configured() -> None:
+    # The service's local-trusted mode only covers requests that carry no
+    # credential at all; an empty bearer would be rejected rather than falling
+    # through to it.
+    client = build_client(HookSettings({}))
+
+    assert "authorization" not in {name.lower() for name in client.headers}
+
+
+def test_a_configured_token_is_sent_as_a_bearer() -> None:
+    client = build_client(HookSettings({"VELOX_HOOK_TOKEN": "agent-token-sentinel"}))
+
+    assert client.headers["authorization"] == "Bearer agent-token-sentinel"
