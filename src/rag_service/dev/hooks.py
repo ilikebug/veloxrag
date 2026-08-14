@@ -22,9 +22,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from contextlib import suppress
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Final
@@ -411,16 +413,100 @@ def resolve_knowledge_base(settings: HookSettings, client: httpx.Client) -> str 
     return None if identifier is None else str(identifier)
 
 
+def _log(message: str) -> None:
+    """Append one line, and never let logging be the thing that fails."""
+    try:
+        home = veloxrag_home()
+        home.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).isoformat()
+        with (home / "hook.log").open("a", encoding="utf-8") as log:
+            log.write(f"{stamp} {message}\n")
+    except OSError:
+        return
+
+
+def _read_payload() -> dict[str, object]:
+    try:
+        loaded = json.load(sys.stdin)
+    except (ValueError, OSError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _text(payload: dict[str, object], key: str) -> str:
+    value = payload.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def retrieve(payload: dict[str, object], settings: HookSettings) -> str:
+    """Return the text to print, or the empty string.
+
+    The question is stored before the search runs. A service that is down should
+    cost this turn its retrieval, not also its recording.
+    """
+    session_id = _text(payload, "session_id")
+    prompt_id = _text(payload, "prompt_id")
+    user_input = _text(payload, "user_input").strip()
+    if not user_input or user_input.startswith("/"):
+        return ""
+    if session_id and prompt_id:
+        try:
+            remember_prompt(session_id, prompt_id, user_input)
+        except OSError as error:
+            _log(f"retrieve could not store the prompt: {error}")
+    with build_client(settings) as client:
+        knowledge_base_id = resolve_knowledge_base(settings, client)
+        if knowledge_base_id is None:
+            return ""
+        response = client.post(
+            f"/v1/knowledge-bases/{knowledge_base_id}/search",
+            json={
+                "query": user_input[:_MAX_QUERY_CODEPOINTS],
+                "top_k": settings.top_k,
+                "rerank": False,
+                "filters": {
+                    "metadata": {
+                        "channel": channel_for(_text(payload, "cwd")),
+                        "source_type": "chat",
+                    }
+                },
+            },
+        )
+    if response.status_code != 200:
+        return ""
+    results = response.json().get("results", ())
+    return render_injection(list(results), floor=settings.score_floor)
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    subcommand = arguments[0] if arguments else ""
+    settings = HookSettings(dict(os.environ))
+    payload = _read_payload()
+    try:
+        if subcommand == "retrieve":
+            rendered = retrieve(payload, settings)
+            if rendered:
+                print(rendered, flush=True)
+        else:
+            _log(f"unknown subcommand: {subcommand!r}")
+    except Exception as error:  # noqa: BLE001 - a hook must not fail the session
+        _log(f"{subcommand} failed: {type(error).__name__}: {error}")
+    return 0
+
+
 __all__ = [
     "HookSettings",
     "build_client",
     "build_turn_metadata",
     "channel_for",
+    "main",
     "prune_stale_state",
     "remember_prompt",
     "render_injection",
     "render_turn",
     "resolve_knowledge_base",
+    "retrieve",
     "should_record",
     "state_directory",
     "take_prompt",

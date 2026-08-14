@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import stat
 from pathlib import Path
@@ -12,6 +14,7 @@ from rag_service.dev.hooks import (
     build_client,
     build_turn_metadata,
     channel_for,
+    main,
     prune_stale_state,
     remember_prompt,
     render_injection,
@@ -394,3 +397,177 @@ def test_a_configured_token_is_sent_as_a_bearer() -> None:
     client = build_client(HookSettings({"VELOX_HOOK_TOKEN": "agent-token-sentinel"}))
 
     assert client.headers["authorization"] == "Bearer agent-token-sentinel"
+
+
+class _Recorder:
+    def __init__(self, *responses: httpx.Response) -> None:
+        self.responses = list(responses)
+        self.requests: list[httpx.Request] = []
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if not self.responses:
+            return httpx.Response(200, json={"results": []})
+        return self.responses.pop(0)
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> None:
+    monkeypatch.setattr(
+        "rag_service.dev.hooks.build_client",
+        lambda settings: httpx.Client(
+            base_url=settings.base_url, transport=httpx.MockTransport(recorder.handle)
+        ),
+    )
+
+
+def _run(
+    monkeypatch: pytest.MonkeyPatch,
+    subcommand: str,
+    payload: dict[str, object],
+    capsys: pytest.CaptureFixture[str],
+) -> tuple[int, str]:
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    code = main([subcommand])
+    return code, capsys.readouterr().out
+
+
+_RETRIEVE_PAYLOAD: dict[str, object] = {
+    "session_id": "session-1",
+    "prompt_id": "prompt-1",
+    "cwd": "/tmp/project",
+    "user_input": "why is the schedule per carrier",
+}
+
+
+def test_retrieve_prints_the_passages_it_finds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    recorder = _Recorder(httpx.Response(200, json={"results": [_PASSAGE]}))
+    _install(monkeypatch, recorder)
+
+    code, out = _run(monkeypatch, "retrieve", _RETRIEVE_PAYLOAD, capsys)
+
+    assert code == 0
+    assert "<retrieved-memory>" in out
+    assert "the schedule is per carrier, not per slug" in out
+
+
+def test_retrieve_scopes_the_search_to_the_current_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    recorder = _Recorder(httpx.Response(200, json={"results": []}))
+    _install(monkeypatch, recorder)
+
+    _run(monkeypatch, "retrieve", _RETRIEVE_PAYLOAD, capsys)
+
+    sent = json.loads(recorder.requests[0].content)
+    assert sent["query"] == "why is the schedule per carrier"
+    assert sent["top_k"] == 5
+    assert sent["filters"] == {"metadata": {"channel": "-tmp-project", "source_type": "chat"}}
+
+
+def test_retrieve_stores_the_question_before_it_searches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Order matters: a service that is down must not also cost the recording of
+    # the turn, so the state write cannot be behind the HTTP call.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+
+    def explode(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("service down")
+
+    monkeypatch.setattr(
+        "rag_service.dev.hooks.build_client",
+        lambda settings: httpx.Client(
+            base_url=settings.base_url, transport=httpx.MockTransport(explode)
+        ),
+    )
+
+    code, out = _run(monkeypatch, "retrieve", _RETRIEVE_PAYLOAD, capsys)
+
+    assert code == 0
+    assert out == ""
+    assert take_prompt("session-1", "prompt-1") == "why is the schedule per carrier"
+
+
+def test_retrieve_says_nothing_when_the_service_answers_with_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    _install(monkeypatch, _Recorder(httpx.Response(503, json={"detail": "not ready"})))
+
+    code, out = _run(monkeypatch, "retrieve", _RETRIEVE_PAYLOAD, capsys)
+
+    assert code == 0
+    assert out == ""
+
+
+def test_retrieve_skips_a_slash_command_without_calling_the_service(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    recorder = _Recorder()
+    _install(monkeypatch, recorder)
+
+    code, out = _run(monkeypatch, "retrieve", {**_RETRIEVE_PAYLOAD, "user_input": "/clear"}, capsys)
+
+    assert code == 0
+    assert out == ""
+    assert recorder.requests == []
+
+
+def test_retrieve_truncates_a_question_past_the_api_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    recorder = _Recorder(httpx.Response(200, json={"results": []}))
+    _install(monkeypatch, recorder)
+
+    _run(monkeypatch, "retrieve", {**_RETRIEVE_PAYLOAD, "user_input": "q" * 9000}, capsys)
+
+    assert len(json.loads(recorder.requests[0].content)["query"]) == 8000
+
+
+def test_retrieve_survives_a_payload_that_is_not_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
+
+    assert main(["retrieve"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_retrieve_says_nothing_when_no_knowledge_base_can_be_resolved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Two knowledge bases and none named: searching the wrong memory is worse
+    # than searching none.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("VELOX_HOOK_KNOWLEDGE_BASE", raising=False)
+    recorder = _Recorder(
+        httpx.Response(200, json={"items": [{"id": _KNOWLEDGE_BASE_ID}, {"id": "other"}]})
+    )
+    _install(monkeypatch, recorder)
+
+    code, out = _run(monkeypatch, "retrieve", _RETRIEVE_PAYLOAD, capsys)
+
+    assert code == 0
+    assert out == ""
+
+
+def test_an_unknown_subcommand_is_logged_and_survived(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+
+    assert main(["sing"]) == 0
+    assert "sing" in (tmp_path / ".veloxrag" / "hook.log").read_text(encoding="utf-8")
