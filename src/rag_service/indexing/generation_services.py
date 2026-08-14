@@ -1231,6 +1231,23 @@ class GenerationService:
                     # rejects the transaction, which is the constraint doing its job.
                     superseded.status = "retiring"
                     await repository.flush()
+                    # Enrolled in the same transaction as the swap. A generation
+                    # that became active without its documents enrolled would look
+                    # healthy while repair skipped every one of them, which is a
+                    # worse failure than not swapping at all: search returns
+                    # nothing and there is no signal saying why.
+                    # The generation's own counts stay at zero. An active
+                    # generation must satisfy expected_point_count =
+                    # actual_point_count — the database refuses to hold one that is
+                    # knowingly incomplete — so the outstanding work is recorded on
+                    # the document rows instead, which repair reads to discover it.
+                    enrolled = await repository.enrol_live_versions(
+                        knowledge_base.id,
+                        generation,
+                        now=now,
+                    )
+                    if enrolled:
+                        await repository.flush()
                 generation.status = "active"
                 knowledge_base.pending_index_generation_id = None
                 knowledge_base.active_index_generation_id = generation.id

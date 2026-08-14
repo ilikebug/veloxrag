@@ -9,11 +9,13 @@ from hashlib import sha256
 from typing import Protocol, cast
 from uuid import UUID
 
-from sqlalchemy import String, and_, delete, func, or_, select, update
+from sqlalchemy import String, and_, delete, func, literal, or_, select, update
 from sqlalchemy import cast as sql_cast
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from rag_service.api.cursors import CursorPosition
+from rag_service.db.models.documents import Document, DocumentIndexState, DocumentVersion
 from rag_service.db.models.knowledge_bases import (
     IndexGenerationCleanupClaim,
     IndexGenerationCreationRequest,
@@ -119,6 +121,16 @@ class GenerationRepository(Protocol):
     async def configured_generation_exists(self, knowledge_base_id: UUID) -> bool: ...
 
     async def building_generation_exists(self, knowledge_base_id: UUID) -> bool: ...
+
+    async def enrol_live_versions(
+        self,
+        knowledge_base_id: UUID,
+        generation: KnowledgeBaseIndexGeneration,
+        *,
+        now: datetime,
+    ) -> int: ...
+
+    async def live_point_total(self, knowledge_base_id: UUID) -> int: ...
 
     async def load_embedding_source(
         self,
@@ -279,6 +291,86 @@ class SqlAlchemyGenerationRepository:
             .limit(1)
         )
         return (await self._session.scalar(statement)) is not None
+
+    async def enrol_live_versions(
+        self,
+        knowledge_base_id: UUID,
+        generation: KnowledgeBaseIndexGeneration,
+        *,
+        now: datetime,
+    ) -> int:
+        """Record every live document version as belonging to a generation.
+
+        The rows claim the documents are already indexed, which is what lets the
+        existing repair pipeline fill them: repair exists for the case where the
+        database says N points should be in a collection and the collection has
+        fewer, so a fresh generation whose collection is empty is the same
+        problem stated at full scale. Without these rows repair skips every
+        document, because it discovers work by joining index states to the
+        generation and finds none.
+
+        The embedding hash is the new generation's, not the old one's: that
+        difference is precisely what makes the vectors need recomputing rather
+        than copying.
+        """
+
+        statement = (
+            insert(DocumentIndexState)
+            .from_select(
+                [
+                    "document_version_id",
+                    "index_generation_id",
+                    "status",
+                    "validated_at",
+                    "expected_point_count",
+                    "actual_point_count",
+                    "next_chunk_index",
+                    "chunk_manifest_checksum_sha256",
+                    "embedding_config_hash",
+                ],
+                select(
+                    DocumentVersion.id,
+                    literal(generation.id),
+                    literal("validated"),
+                    literal(now),
+                    DocumentVersion.chunk_count,
+                    DocumentVersion.chunk_count,
+                    DocumentVersion.chunk_count,
+                    DocumentVersion.chunk_manifest_checksum_sha256,
+                    literal(generation.embedding_config_hash),
+                )
+                .select_from(Document)
+                .join(DocumentVersion, DocumentVersion.id == Document.current_version_id)
+                .where(
+                    Document.knowledge_base_id == knowledge_base_id,
+                    Document.status == "active",
+                    Document.deleted_at.is_(None),
+                    DocumentVersion.status == "ready",
+                    DocumentVersion.chunk_count.is_not(None),
+                    DocumentVersion.chunk_manifest_checksum_sha256.is_not(None),
+                ),
+            )
+            .on_conflict_do_nothing()
+        )
+        result = await self._session.execute(statement)
+        return int(getattr(result, "rowcount", 0) or 0)
+
+    async def live_point_total(self, knowledge_base_id: UUID) -> int:
+        """How many points a fully built generation should hold for this base."""
+
+        statement = (
+            select(func.coalesce(func.sum(DocumentVersion.chunk_count), 0))
+            .select_from(Document)
+            .join(DocumentVersion, DocumentVersion.id == Document.current_version_id)
+            .where(
+                Document.knowledge_base_id == knowledge_base_id,
+                Document.status == "active",
+                Document.deleted_at.is_(None),
+                DocumentVersion.status == "ready",
+                DocumentVersion.chunk_count.is_not(None),
+            )
+        )
+        return int(await self._session.scalar(statement) or 0)
 
     async def load_embedding_source(
         self,
