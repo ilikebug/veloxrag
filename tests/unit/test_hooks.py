@@ -7,9 +7,12 @@ from pathlib import Path
 import pytest
 
 from rag_service.dev.hooks import (
+    build_turn_metadata,
     channel_for,
     prune_stale_state,
     remember_prompt,
+    render_turn,
+    should_record,
     state_directory,
     take_prompt,
 )
@@ -97,3 +100,89 @@ def test_state_is_not_readable_by_other_users(
     remember_prompt("session-1", "prompt-2", "another question")
 
     assert stat.S_IMODE(written.stat().st_mode) == 0o600
+
+
+_LONG_ANSWER = "The knowledge base refuses a second generation. " * 8
+
+
+def test_a_turn_that_concluded_something_is_recorded() -> None:
+    assert should_record("why does ingest refuse", _LONG_ANSWER) is True
+
+
+def test_an_acknowledgement_is_not_recorded() -> None:
+    # A command and an "ok" dominate a coding session by count and carry no
+    # retrievable conclusion. The batch converter drops short sessions for the
+    # same reason; recording per turn loses that filter and needs its own.
+    assert should_record("run the tests", "Done, all 412 passed.") is False
+
+
+def test_a_slash_command_is_not_recorded() -> None:
+    assert should_record("/clear", _LONG_ANSWER) is False
+
+
+def test_the_threshold_counts_the_redacted_text() -> None:
+    # Redaction shortens the answer, so a reply that is mostly a leaked token
+    # must not buy its way past the floor with characters that get removed.
+    answer = "here is the key: " + "sk-" + "a" * 300
+
+    assert should_record("what is the key", answer) is False
+
+
+def test_a_recorded_turn_keeps_both_halves_and_redacts_them() -> None:
+    body = render_turn(
+        user_input="why does it fail with Authorization: Bearer abcdefghijklmnopqr",
+        assistant_text=_LONG_ANSWER,
+        channel="-tmp-project",
+        session_id="session-1",
+        occurred_at="2026-08-14T09:00:00+00:00",
+    )
+
+    assert "abcdefghijklmnopqr" not in body
+    assert "[REDACTED]" in body
+    # Scoped to the sections rather than to the whole body: a render that swapped
+    # the two halves would satisfy "both are present somewhere".
+    question = body.split("## Question", 1)[1].split("## Answer", 1)[0]
+    answer = body.split("## Answer", 1)[1]
+    assert "why does it fail" in question
+    assert "The knowledge base refuses a second generation." in answer
+    assert "The knowledge base refuses a second generation." not in question
+
+
+def test_headings_inside_an_answer_do_not_break_the_document() -> None:
+    # An answer routinely contains Markdown headings. Left alone they would sit
+    # at the same level as the document's own structure, and the chunker's
+    # title_path would attribute passages to a heading the answer invented.
+    body = render_turn(
+        user_input="show me the layout",
+        assistant_text="## Overview\n\n" + _LONG_ANSWER,
+        channel="-tmp-project",
+        session_id="session-1",
+        occurred_at="2026-08-14T09:00:00+00:00",
+    )
+
+    assert "\n## Overview" not in body
+    assert "#### Overview" in body
+
+
+def test_metadata_uses_only_declared_filter_fields() -> None:
+    # The filter schema is frozen by the first generation. A field outside it
+    # produces metadata that is silently unfilterable.
+    metadata = build_turn_metadata(
+        user_input="why does it fail",
+        assistant_text=_LONG_ANSWER,
+        channel="-tmp-project",
+        cwd="/tmp/project",
+        session_id="session-1",
+        occurred_at="2026-08-14T09:00:00+00:00",
+    )
+
+    assert metadata == {
+        "source_type": "chat",
+        "doc_type": "claude-code",
+        "section": "turn",
+        "channel": "-tmp-project",
+        "thread_id": "session-1",
+        "source_path": "/tmp/project",
+        "lang": "en",
+        "occurred_at": "2026-08-14T09:00:00+00:00",
+    }

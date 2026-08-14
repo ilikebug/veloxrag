@@ -29,8 +29,14 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Final
 
+from rag_service.dev.chat_transcripts import _demote_headings, _language_of, redact
+
 _STATE_TTL_SECONDS: Final = 24 * 60 * 60
 _STATE_FILE_MODE: Final = 0o600
+# A heuristic standing in for "did this turn conclude anything". It will discard
+# some short but valuable answers; that is the accepted cost of not spending a
+# model call per turn to decide. Override with VELOX_HOOK_MIN_ANSWER_CHARACTERS.
+_DEFAULT_MIN_ANSWER_CHARACTERS: Final = 200
 
 
 def veloxrag_home() -> Path:
@@ -150,10 +156,87 @@ def prune_stale_state() -> None:
             continue
 
 
+def should_record(user_input: str, assistant_text: str, *, minimum: int | None = None) -> bool:
+    """Decide whether a turn's answer is substantial enough to index.
+
+    Stands in for "did this turn conclude anything", measured on the answer
+    because that is where a conclusion would be. Length is measured *after*
+    redaction so a reply that is mostly credentials cannot clear the floor with
+    characters about to be removed. Slash commands are skipped because they are
+    instructions to the tool, not questions with an answer worth keeping.
+    """
+    floor = _DEFAULT_MIN_ANSWER_CHARACTERS if minimum is None else minimum
+    if not user_input.strip() or user_input.lstrip().startswith("/"):
+        return False
+    return len(redact(assistant_text).strip()) >= floor
+
+
+def render_turn(
+    *,
+    user_input: str,
+    assistant_text: str,
+    channel: str,
+    session_id: str,
+    occurred_at: str,
+) -> str:
+    """Render one exchange, with the same shape the batch converter produces.
+
+    A document that does not name its project, session or time is
+    indistinguishable from every other once it is a passage in a search result.
+    """
+    return (
+        "\n".join(
+            (
+                f"# claude-code turn in {channel}",
+                "",
+                f"- Project: {channel}",
+                f"- Session: {session_id}",
+                f"- Recorded: {occurred_at}",
+                "",
+                "## Question",
+                "",
+                _demote_headings(redact(user_input)),
+                "",
+                "## Answer",
+                "",
+                _demote_headings(redact(assistant_text)),
+                "",
+            )
+        ).rstrip()
+        + "\n"
+    )
+
+
+def build_turn_metadata(
+    *,
+    user_input: str,
+    assistant_text: str,
+    channel: str,
+    cwd: str,
+    session_id: str,
+    occurred_at: str,
+) -> dict[str, str]:
+    return {
+        "source_type": "chat",
+        "doc_type": "claude-code",
+        # What tells these apart from whole-session documents, which carry no
+        # section. The field cannot be added later: the schema is frozen.
+        "section": "turn",
+        "channel": channel,
+        "thread_id": session_id,
+        "source_path": cwd,
+        "lang": _language_of(f"{user_input}\n{assistant_text}"),
+        "occurred_at": occurred_at,
+    }
+
+
 __all__ = [
+    "build_turn_metadata",
     "channel_for",
     "prune_stale_state",
     "remember_prompt",
+    "render_turn",
+    "should_record",
     "state_directory",
     "take_prompt",
     "veloxrag_home",
