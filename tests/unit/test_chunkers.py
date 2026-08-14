@@ -1003,3 +1003,32 @@ def test_lexical_boundary_memory_does_not_scale_with_total_newline_count() -> No
     large_peak = peak_for(50_000)
 
     assert large_peak < small_peak * 3
+
+
+def test_blank_windows_are_never_emitted_as_chunks() -> None:
+    """A whitespace-only chunk fails the whole document, terminally.
+
+    The embedding gateway rejects blank input with EMBEDDING_INPUT_INVALID, which
+    is not retryable, so one such chunk fails the document that contained it. Blank
+    windows appear where blank lines cluster — between transcript turns, say — and
+    get more likely as the chunk size shrinks, which is exactly when someone is
+    tuning. Regression: max=300/overlap=60 over this shape used to emit "\n\n".
+    """
+
+    text = "# Title\n\n" + "\n\n".join(f"## Turn {index}\n\n{'word ' * 40}" for index in range(12))
+    text += "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n" + "tail paragraph\n"
+    artifact = MarkdownTextParser().parse(text.encode())
+
+    for max_codepoints, overlap in ((600, 100), (300, 60), (200, 40), (150, 30)):
+        chunks = list(
+            RecursiveTextChunker(
+                max_chunk_codepoints=max_codepoints,
+                target_overlap_codepoints=overlap,
+            ).chunk(artifact)
+        )
+
+        assert chunks, (max_codepoints, overlap)
+        blank = [chunk.text for chunk in chunks if not chunk.text.strip()]
+        assert not blank, (max_codepoints, overlap, blank[:2])
+        # Skipping a window must not leave a hole in the sequence.
+        assert [chunk.chunk_index for chunk in chunks] == list(range(len(chunks)))

@@ -1072,6 +1072,19 @@ class RecursiveTextChunker:
                     raise ValueError("document chunker could not make progress")
                 start = reduced_overlap_start
                 continue
+            # A window can land entirely on blank lines. That gets likelier as the
+            # chunk size shrinks, and transcripts separate turns with blank lines,
+            # so it shows up exactly while someone is tuning. Such a chunk carries
+            # nothing and the embedding gateway rejects it as invalid input with a
+            # non-retryable error, failing the whole document.
+            #
+            # Widening to the hard end rather than skipping the window: chunks have
+            # to tile the text without gaps, because the offsets are what citations
+            # and coverage are built on. A blank run longer than one whole window
+            # still yields a blank chunk, which no widening can fix without
+            # breaking that tiling.
+            if not text[start:end].strip() and end < hard_end:
+                end = hard_end
             yield Chunk.from_source(
                 chunk_index=chunk_index,
                 source_text=text,
