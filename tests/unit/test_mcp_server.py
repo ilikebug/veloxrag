@@ -76,6 +76,7 @@ async def test_exposed_tools_are_read_only() -> None:
     # real.
     assert {tool.name for tool in tools} == {
         "search_memory",
+        "read_document",
         "list_documents",
         "memory_status",
     }

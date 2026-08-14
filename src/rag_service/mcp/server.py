@@ -41,6 +41,8 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 # Reranking adds a provider round trip per query. Left to the agent to ask for,
 # because only the agent knows whether this question is worth the latency.
 _MAX_TOP_K = 50
+_DEFAULT_READ_END = 2000
+_MAX_READ_CODEPOINTS = 8000
 
 
 class RagMcpConfigError(Exception):
@@ -132,15 +134,26 @@ def build_server(settings: _Settings) -> MCPServer:
             "before answering questions about this project's history, decisions, or "
             "documentation; the answer is often already recorded. Results are "
             "passages, not whole documents, and each carries the document it came "
-            "from with the character range it occupies there."
+            "from with the character range it occupies there.\n\n"
+            "Judging relevance is your job, not the search's. Ask for more "
+            "passages than you expect to use, keep the ones that look right, and "
+            "call read_document on those to see the text around them before "
+            "deciding. Measured on this corpus, the answer sits just outside the "
+            "matched passage often enough that reading around a hit takes the "
+            "chance of having it in hand from 0.89 to 1.00; a passage that looks "
+            "truncated is worth widening rather than discarding."
         ),
     )
 
     @server.tool(
         description=(
             "Search indexed memory and return the passages that match. Prefer a "
-            "specific question over keywords. Set rerank when the first result "
-            "matters more than latency."
+            "specific question over keywords. Retrieving more than you need and "
+            "picking among them yourself works better than trusting the first "
+            "result: the ranking is vector similarity, which cannot tell that a "
+            "passage merely repeats the question. Leave rerank off unless this "
+            "service has a rerank profile configured — the default setup has "
+            "none, and asking for it fails with RERANK_NOT_CONFIGURED."
         )
     )
     async def search_memory(
@@ -181,6 +194,52 @@ def build_server(settings: _Settings) -> MCPServer:
                 }
                 for item in results
             ],
+            ensure_ascii=False,
+            indent=1,
+        )
+
+    @server.tool(
+        description=(
+            "Read a document's text around a character range, to see what a "
+            "search result was cut off from. Pass the document_id and the "
+            "source.start_offset / source.end_offset of a passage, widened by a "
+            "few hundred characters on each side. Offsets past either end are "
+            "clamped rather than refused, and total_codepoints tells a clamped "
+            "range from an exhausted one."
+        )
+    )
+    async def read_document(
+        document_id: Annotated[str, Field(description="From a search result")],
+        start: Annotated[int, Field(default=0, ge=0)] = 0,
+        end: Annotated[int, Field(default=_DEFAULT_READ_END, ge=1)] = _DEFAULT_READ_END,
+    ) -> str:
+        try:
+            identifier = UUID(document_id)
+        except (AttributeError, TypeError, ValueError):
+            return "document_id is not a valid id; take it from a search result."
+        if end <= start:
+            return "end must be greater than start."
+        # Bounded here rather than left to the caller: an agent widening a hit
+        # wants context, and a request for the whole document would spend its
+        # window on text it did not ask about.
+        if end - start > _MAX_READ_CODEPOINTS:
+            end = start + _MAX_READ_CODEPOINTS
+        async with _client(settings) as client:
+            response = await client.get(
+                f"/v1/documents/{identifier}/content",
+                params={"start": start, "end": end},
+            )
+        if response.status_code != 200:
+            return _failure(response)
+        body = response.json()
+        return json.dumps(
+            {
+                "document_id": body.get("document_id"),
+                "start_offset": body.get("start_offset"),
+                "end_offset": body.get("end_offset"),
+                "total_codepoints": body.get("total_codepoints"),
+                "text": body.get("text", ""),
+            },
             ensure_ascii=False,
             indent=1,
         )
