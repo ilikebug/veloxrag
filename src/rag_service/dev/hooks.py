@@ -1,13 +1,28 @@
 """Claude Code hooks that read from and write to the knowledge base.
 
-Two subcommands, bound to two hook events. `retrieve` runs on UserPromptSubmit
-and prints the passages it finds, which Claude Code adds to the turn's context.
-`record` runs on Stop and uploads the turn that just finished.
+Five subcommands. Two are bound to hook events: `retrieve` runs on
+UserPromptSubmit and prints the passages it finds, which Claude Code adds to
+the turn's context; `record` runs on Stop and uploads the turn that just
+finished. Three are run by an operator at a terminal: `install` and
+`uninstall` manage the two hook entries in `~/.claude/settings.json`, and
+`ingest` backfills documents produced by `velox-chat-transcripts`.
 
-Both are advisory. Every failure path prints nothing and exits 0: a memory that
-is merely absent leaves the session exactly as it was, while a hook that fails
-loudly makes the tool worse than not having it. `record` in particular never
-exits 2, which would prevent Claude from stopping and put the session in a loop.
+These two groups follow opposite failure conventions on purpose, and that is
+not an inconsistency to fix.
+
+`retrieve` and `record` are advisory and run on every prompt. Every failure
+path in them prints nothing and exits 0: a memory that is merely absent
+leaves the session exactly as it was, while a hook that fails loudly makes the
+tool worse than not having it. `record` in particular never exits 2, which
+would prevent Claude from stopping and put the session in a loop.
+
+`install`, `uninstall` and `ingest` are the opposite: run once, on purpose, by
+a human watching the terminal. Silence here is not safety, it is a mistake
+going unnoticed -- a hand-merged settings.json that never loads because the
+JSON is subtly wrong, or a chat transcript uploaded without the metadata that
+would have made it retrievable, permanently, because documents cannot be
+deleted and the same content re-uploaded is refused as a 409 duplicate. So
+these three fail loudly: a clear message on stderr and a non-zero exit.
 
 Neither hook reads the transcript. The hook payload carries
 `last_assistant_message` for the turn that just ended, and the documentation
@@ -22,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -101,7 +117,7 @@ def _state_path(session_id: str) -> Path:
     return state_directory() / f"{digest}.json"
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
+def _atomic_write(path: Path, payload: bytes, *, mode: int = _STATE_FILE_MODE) -> None:
     """Write state to disk without a torn or world-readable file.
 
     Duplicates the pattern in `jobs/worker.write_worker_health` and
@@ -117,10 +133,16 @@ def _atomic_write(path: Path, payload: bytes) -> None:
     it is here so the requirement is stated explicitly rather than inherited
     from a library default that a later change to how the file is created
     could quietly relax.
+
+    `mode` defaults to that same 0600 for the hook-state callers below and is
+    overridden by `install`/`uninstall`, which write `~/.claude/settings.json`
+    -- a file that is not a secret and must keep whatever mode it already had
+    (or the process default, for a new one), not be silently locked down to
+    0600.
     """
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        os.fchmod(descriptor, _STATE_FILE_MODE)
+        os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb", closefd=True) as stream:
             descriptor = -1
             stream.write(payload)
@@ -425,6 +447,300 @@ def _log(message: str) -> None:
         return
 
 
+# --- install / uninstall / ingest ------------------------------------------
+#
+# Everything below backs the three operator subcommands. Unlike retrieve() and
+# record() above, every failure path here prints a message on stderr and
+# returns non-zero -- see the module docstring for why the two conventions
+# coexist deliberately.
+
+_UVX_BASE_COMMAND: Final = "uvx --from git+https://github.com/ilikebug/veloxrag velox-hook"
+_RETRIEVE_HOOK_TIMEOUT: Final = 10
+_RECORD_HOOK_TIMEOUT: Final = 15
+# What identifies a hook entry as ours, for both idempotent install and
+# selective uninstall: any hook whose command contains this is ours to touch.
+_HOOK_MARKER: Final = "velox-hook"
+
+
+class SettingsError(Exception):
+    """`~/.claude/settings.json` could not be safely read or written."""
+
+
+def _settings_path() -> Path:
+    return Path.home() / ".claude" / "settings.json"
+
+
+def _read_settings(path: Path) -> dict[str, object]:
+    """Load settings.json, or {} when it does not exist yet.
+
+    Raises SettingsError, without touching the file, when it exists but does
+    not parse as a JSON object. Overwriting a config the operator cannot
+    currently read back is worse than refusing to run -- and a hand-merged
+    settings.json, which is exactly what documenting this as a copy-paste
+    snippet produces today, is exactly the file that ends up unparseable.
+    """
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SettingsError(f"cannot read {path}: {error}") from error
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise SettingsError(f"{path} is not valid JSON: {error}") from error
+    if not isinstance(loaded, dict):
+        raise SettingsError(f"{path} does not contain a JSON object")
+    return loaded
+
+
+def _settings_write_mode(path: Path) -> int:
+    """The permission bits to write settings.json with.
+
+    `_atomic_write`'s 0600 default is right for the hook state file, which
+    holds an unredacted prompt, and wrong here: settings.json is not a secret,
+    it already holds permissions the operator (or Claude Code) chose, and
+    `install` must not silently narrow them. A file that does not exist yet
+    gets the process default -- what a plain `open(..., "w")` would have
+    produced -- rather than 0600.
+    """
+    if path.exists():
+        return stat.S_IMODE(path.stat().st_mode)
+    current_umask = os.umask(0)
+    os.umask(current_umask)
+    return 0o666 & ~current_umask
+
+
+def _hook_base_command(*, local: bool) -> str:
+    if not local:
+        return _UVX_BASE_COMMAND
+    # sys.argv[0] of the real process, not whatever argv main() was called
+    # with in a test: --local means "the executable actually running right
+    # now", which is what someone testing from this worktree, before the
+    # branch is pushed anywhere, needs recorded instead of a `uvx` fetch.
+    executable = Path(sys.argv[0]).resolve()
+    if not executable.exists():
+        raise SettingsError(f"--local executable does not exist: {executable}")
+    return str(executable)
+
+
+def _upsert_hook(entries: list[object], *, command: str, timeout: int) -> str:
+    """Point the one entry whose command mentions velox-hook at `command`.
+
+    Appends a new entry only when none matches. This, not the command string
+    itself, is what makes `install` idempotent: run twice, or switch between
+    `--local` and the default form, and the event ends up with exactly one
+    entry rather than a second one alongside the first.
+    """
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        hook_list = entry.get("hooks")
+        if not isinstance(hook_list, list):
+            continue
+        for hook in hook_list:
+            if isinstance(hook, dict) and _HOOK_MARKER in str(hook.get("command", "")):
+                hook["command"] = command
+                hook["timeout"] = timeout
+                return "updated"
+    entries.append({"hooks": [{"type": "command", "command": command, "timeout": timeout}]})
+    return "added"
+
+
+def install(*, local: bool) -> int:
+    """Write or update the two hook entries in `~/.claude/settings.json`.
+
+    Loads the file, changes only `hooks.UserPromptSubmit` and `hooks.Stop`,
+    and writes the whole structure back -- every other key, and every other
+    hook already registered for those two events, survives untouched. This
+    replaces the documented copy-paste snippet, which is a complete JSON
+    document and destroys the rest of settings.json when pasted over it.
+    """
+    path = _settings_path()
+    try:
+        settings = _read_settings(path)
+    except SettingsError as error:
+        print(f"velox-hook install: {error}", file=sys.stderr)
+        return 1
+    try:
+        base_command = _hook_base_command(local=local)
+    except SettingsError as error:
+        print(f"velox-hook install: {error}", file=sys.stderr)
+        return 1
+
+    created = not path.exists()
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        print(
+            f"velox-hook install: {path} has a 'hooks' key that is not an object",
+            file=sys.stderr,
+        )
+        return 1
+
+    changes: list[tuple[str, str, str]] = []
+    for event, subcommand, timeout in (
+        ("UserPromptSubmit", "retrieve", _RETRIEVE_HOOK_TIMEOUT),
+        ("Stop", "record", _RECORD_HOOK_TIMEOUT),
+    ):
+        entries = hooks.setdefault(event, [])
+        if not isinstance(entries, list):
+            print(
+                f"velox-hook install: {path} has a '{event}' hook list that is not an array",
+                file=sys.stderr,
+            )
+            return 1
+        command = f"{base_command} {subcommand}"
+        action = _upsert_hook(entries, command=command, timeout=timeout)
+        changes.append((event, action, command))
+
+    mode = _settings_write_mode(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(path, (json.dumps(settings, indent=2) + "\n").encode("utf-8"), mode=mode)
+
+    if created:
+        print(f"created {path}")
+    for event, action, command in changes:
+        print(f"{action} {event} hook: {command}")
+    return 0
+
+
+def uninstall() -> int:
+    """Remove only the velox-hook entries from `~/.claude/settings.json`.
+
+    Prunes empty structure left behind -- an entry whose hooks list becomes
+    empty, an event whose entry list becomes empty, and the `hooks` key itself
+    -- but never touches a hook belonging to something else.
+    """
+    path = _settings_path()
+    try:
+        settings = _read_settings(path)
+    except SettingsError as error:
+        print(f"velox-hook uninstall: {error}", file=sys.stderr)
+        return 1
+    if not path.exists():
+        print(f"velox-hook uninstall: nothing to remove, {path} does not exist")
+        return 0
+
+    hooks = settings.get("hooks")
+    removed_events: list[str] = []
+    if isinstance(hooks, dict):
+        for event in list(hooks):
+            entries = hooks[event]
+            if not isinstance(entries, list):
+                continue
+            kept_entries: list[object] = []
+            event_changed = False
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    kept_entries.append(entry)
+                    continue
+                hook_list = entry.get("hooks")
+                if not isinstance(hook_list, list):
+                    kept_entries.append(entry)
+                    continue
+                kept_hooks = [
+                    hook
+                    for hook in hook_list
+                    if not (isinstance(hook, dict) and _HOOK_MARKER in str(hook.get("command", "")))
+                ]
+                if len(kept_hooks) != len(hook_list):
+                    event_changed = True
+                if kept_hooks:
+                    entry["hooks"] = kept_hooks
+                    kept_entries.append(entry)
+                # else: every hook in this entry was ours, so the entry itself
+                # is pruned rather than kept with an empty "hooks" list.
+            if event_changed:
+                removed_events.append(event)
+            if kept_entries:
+                hooks[event] = kept_entries
+            else:
+                del hooks[event]
+        if not hooks:
+            del settings["hooks"]
+
+    if not removed_events:
+        print("velox-hook uninstall: nothing to remove, no velox-hook entries found")
+        return 0
+
+    mode = _settings_write_mode(path)
+    _atomic_write(path, (json.dumps(settings, indent=2) + "\n").encode("utf-8"), mode=mode)
+    for event in removed_events:
+        print(f"removed {event} hook")
+    return 0
+
+
+def ingest(directory: Path) -> int:
+    """Upload a `velox-chat-transcripts` output directory of `.md`/`.metadata.json` pairs.
+
+    A `.md` file with no sibling metadata is skipped, never uploaded bare:
+    that is precisely the mistake this command exists to prevent, and it
+    cannot be undone afterwards -- documents cannot be deleted, and the same
+    content re-uploaded later is refused as a 409 duplicate rather than
+    replacing what is there.
+    """
+    if not directory.is_dir():
+        print(f"velox-hook ingest: not a directory: {directory}", file=sys.stderr)
+        return 1
+
+    settings = HookSettings(dict(os.environ))
+    accepted = duplicate = skipped = failed = 0
+    with build_client(settings) as client:
+        knowledge_base_id = resolve_knowledge_base(settings, client)
+        if knowledge_base_id is None:
+            print(
+                "velox-hook ingest: no knowledge base resolved; set VELOX_HOOK_KNOWLEDGE_BASE",
+                file=sys.stderr,
+            )
+            return 1
+
+        markdown_paths = sorted(directory.glob("*.md"))
+        total = len(markdown_paths)
+        for index, markdown_path in enumerate(markdown_paths, start=1):
+            metadata_path = markdown_path.with_name(f"{markdown_path.stem}.metadata.json")
+            # Printed per document rather than only at the end: embedding a few
+            # dozen documents takes minutes, and a command silent for ten
+            # minutes looks hung.
+            print(f"[{index}/{total}] {markdown_path.name}", flush=True)
+            if not metadata_path.exists():
+                print(f"  skipped: no {metadata_path.name}", file=sys.stderr)
+                skipped += 1
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                print(f"  skipped: cannot read {metadata_path.name}: {error}", file=sys.stderr)
+                skipped += 1
+                continue
+
+            # A 202 only means the upload job was queued; the document becomes
+            # searchable once the ingestion worker finishes, not when this
+            # request returns.
+            response = client.post(
+                f"/v1/knowledge-bases/{knowledge_base_id}/documents",
+                files={
+                    "file": (
+                        markdown_path.name,
+                        markdown_path.read_bytes(),
+                        "text/markdown",
+                    )
+                },
+                data={"display_name": markdown_path.name, "metadata": json.dumps(metadata)},
+            )
+            if response.status_code == 202:
+                accepted += 1
+                print("  accepted")
+            elif response.status_code == 409:
+                duplicate += 1
+                print("  duplicate (already indexed)")
+            else:
+                failed += 1
+                print(f"  failed: {response.status_code}", file=sys.stderr)
+
+    print(f"accepted={accepted} duplicate={duplicate} skipped={skipped} failed={failed}")
+    return 1 if failed else 0
+
+
 def _read_payload() -> dict[str, object]:
     try:
         loaded = json.load(sys.stdin)
@@ -533,6 +849,28 @@ def record(payload: dict[str, object], settings: HookSettings) -> None:
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     subcommand = arguments[0] if arguments else ""
+    rest = arguments[1:]
+
+    # install/uninstall/ingest never read stdin: they are not hook events, and
+    # blocking on stdin would hang a command run directly at a terminal.
+    if subcommand == "install":
+        local = "--local" in rest
+        unknown = [arg for arg in rest if arg != "--local"]
+        if unknown:
+            print(f"velox-hook install: unknown argument: {unknown[0]}", file=sys.stderr)
+            return 1
+        return install(local=local)
+    if subcommand == "uninstall":
+        if rest:
+            print(f"velox-hook uninstall: unknown argument: {rest[0]}", file=sys.stderr)
+            return 1
+        return uninstall()
+    if subcommand == "ingest":
+        if len(rest) != 1:
+            print("velox-hook ingest: usage: velox-hook ingest <directory>", file=sys.stderr)
+            return 1
+        return ingest(Path(rest[0]))
+
     settings = HookSettings(dict(os.environ))
     payload = _read_payload()
     try:
@@ -551,9 +889,12 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "HookSettings",
+    "SettingsError",
     "build_client",
     "build_turn_metadata",
     "channel_for",
+    "ingest",
+    "install",
     "main",
     "prune_stale_state",
     "record",
@@ -565,5 +906,6 @@ __all__ = [
     "should_record",
     "state_directory",
     "take_prompt",
+    "uninstall",
     "veloxrag_home",
 ]

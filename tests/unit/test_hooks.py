@@ -4,6 +4,7 @@ import io
 import json
 import os
 import stat
+import sys
 import tomllib
 from pathlib import Path
 
@@ -760,6 +761,247 @@ def test_record_sends_the_metadata_as_declared_fields(
     for field in ("source_type", "doc_type", "section", "channel", "thread_id"):
         assert field in body
     assert "-tmp-project" in body
+
+
+def _settings_path(tmp_path: Path) -> Path:
+    return tmp_path / ".claude" / "settings.json"
+
+
+def test_install_into_a_missing_file_creates_it_with_both_events(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings_path = _settings_path(tmp_path)
+    assert not settings_path.exists()
+
+    code = main(["install"])
+
+    assert code == 0
+    written = json.loads(settings_path.read_text(encoding="utf-8"))
+    retrieve_command = written["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+    record_command = written["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert retrieve_command.endswith("velox-hook retrieve")
+    assert record_command.endswith("velox-hook record")
+    assert written["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"] == 10
+    assert written["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 15
+    assert "created" in capsys.readouterr().out
+
+
+def test_install_preserves_unrelated_content_exactly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Asserted on specific keys, not just on length: a merge that dropped and
+    # replaced a key with something the same size would still pass a length
+    # check, but destroy the operator's permissions or status line.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings_path = _settings_path(tmp_path)
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "permissions": {"allow": ["Bash(ls:*)"]},
+                "statusLine": {"type": "command", "command": "echo hi"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(["install"])
+
+    assert code == 0
+    written = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert written["permissions"] == {"allow": ["Bash(ls:*)"]}
+    assert written["statusLine"] == {"type": "command", "command": "echo hi"}
+    assert "hooks" in written
+
+
+def test_install_twice_yields_exactly_one_entry_per_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings_path = _settings_path(tmp_path)
+
+    main(["install"])
+    code = main(["install"])
+
+    assert code == 0
+    written = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert len(written["hooks"]["UserPromptSubmit"]) == 1
+    assert len(written["hooks"]["UserPromptSubmit"][0]["hooks"]) == 1
+    assert len(written["hooks"]["Stop"]) == 1
+    assert len(written["hooks"]["Stop"][0]["hooks"]) == 1
+
+
+def test_install_switching_command_forms_replaces_rather_than_appends(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings_path = _settings_path(tmp_path)
+    local_executable = tmp_path / "velox-hook-local"
+    local_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [str(local_executable), "install", "--local"])
+
+    main(["install"])
+    code = main(["install", "--local"])
+
+    assert code == 0
+    written = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert len(written["hooks"]["UserPromptSubmit"]) == 1
+    assert len(written["hooks"]["Stop"]) == 1
+    retrieve_command = written["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+    assert retrieve_command == f"{local_executable.resolve()} retrieve"
+
+
+def test_install_refuses_an_unparseable_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings_path = _settings_path(tmp_path)
+    settings_path.parent.mkdir(parents=True)
+    original = b'{"permissions": {"allow": ["Bash(ls:*)"]}'  # missing closing brace
+    settings_path.write_bytes(original)
+
+    code = main(["install"])
+
+    assert code != 0
+    assert settings_path.read_bytes() == original
+    assert capsys.readouterr().err != ""
+
+
+def test_install_preserves_an_existing_files_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings_path = _settings_path(tmp_path)
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text("{}", encoding="utf-8")
+    settings_path.chmod(0o640)
+
+    code = main(["install"])
+
+    assert code == 0
+    assert stat.S_IMODE(settings_path.stat().st_mode) == 0o640
+
+
+def test_uninstall_removes_only_velox_hook_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings_path = _settings_path(tmp_path)
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "permissions": {"allow": ["Bash(ls:*)"]},
+                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo other"}]}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    main(["install"])
+
+    code = main(["uninstall"])
+
+    assert code == 0
+    written = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert written["permissions"] == {"allow": ["Bash(ls:*)"]}
+    # The foreign Stop hook survives in the same event a velox-hook entry was
+    # also registered in.
+    assert written["hooks"]["Stop"] == [{"hooks": [{"type": "command", "command": "echo other"}]}]
+    assert "UserPromptSubmit" not in written["hooks"]
+    assert "removed" in capsys.readouterr().out
+
+
+def test_uninstall_with_nothing_to_remove_says_so_and_leaves_the_file_valid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings_path = _settings_path(tmp_path)
+    settings_path.parent.mkdir(parents=True)
+    original = json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}}).encode("utf-8")
+    settings_path.write_bytes(original)
+
+    code = main(["uninstall"])
+
+    assert code == 0
+    assert settings_path.read_bytes() == original
+    assert "nothing to remove" in capsys.readouterr().out
+
+
+def _write_transcript_pair(directory: Path, stem: str, *, with_metadata: bool = True) -> None:
+    (directory / f"{stem}.md").write_text(f"# {stem}\n\nbody text\n", encoding="utf-8")
+    if with_metadata:
+        (directory / f"{stem}.metadata.json").write_text(
+            json.dumps({"source_type": "chat_transcript", "channel": "-tmp-project"}),
+            encoding="utf-8",
+        )
+
+
+def test_ingest_skips_a_document_whose_metadata_file_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    transcripts = tmp_path / "transcripts"
+    transcripts.mkdir()
+    _write_transcript_pair(transcripts, "claude-code-session-1")
+    _write_transcript_pair(transcripts, "claude-code-session-2", with_metadata=False)
+    recorder = _Recorder(httpx.Response(202, json={"job_id": "job-1"}))
+    _install(monkeypatch, recorder)
+
+    code = main(["ingest", str(transcripts)])
+
+    assert code == 0
+    # Only the document with metadata was ever POSTed -- the bare one never
+    # reaches the wire, because uploading it without metadata is exactly the
+    # unfixable mistake this command exists to prevent.
+    assert len(recorder.requests) == 1
+    assert b"claude-code-session-1.md" in recorder.requests[0].content
+    captured = capsys.readouterr()
+    assert "claude-code-session-2.metadata.json" in captured.err
+    assert "skipped=1" in captured.out
+    assert "accepted=1" in captured.out
+
+
+def test_ingest_reports_409_as_duplicate_rather_than_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    transcripts = tmp_path / "transcripts"
+    transcripts.mkdir()
+    _write_transcript_pair(transcripts, "claude-code-session-1")
+    _install(
+        monkeypatch,
+        _Recorder(httpx.Response(409, json={"error": {"code": "DUPLICATE_DOCUMENT"}})),
+    )
+
+    code = main(["ingest", str(transcripts)])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "duplicate=1" in out
+    assert "failed=0" in out
+
+
+def test_ingest_fails_loudly_when_no_knowledge_base_resolves(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("VELOX_HOOK_KNOWLEDGE_BASE", raising=False)
+    transcripts = tmp_path / "transcripts"
+    transcripts.mkdir()
+    _install(
+        monkeypatch,
+        _Recorder(
+            httpx.Response(200, json={"items": [{"id": _KNOWLEDGE_BASE_ID}, {"id": "other"}]})
+        ),
+    )
+
+    code = main(["ingest", str(transcripts)])
+
+    assert code != 0
+    assert "VELOX_HOOK_KNOWLEDGE_BASE" in capsys.readouterr().err
 
 
 def test_the_console_script_points_at_this_module() -> None:
