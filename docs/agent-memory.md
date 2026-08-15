@@ -8,9 +8,32 @@ every prompt, so retrieval stops depending on the model remembering to ask.
 
 ## Turning it on
 
-Two entries in `~/.claude/settings.json`, at **user** scope rather than project scope, so every
-project gets recorded rather than only the one where you happened to add the hook. Retrieval is
-still scoped per project regardless of where the hooks are registered — see below.
+```
+velox-hook install
+```
+
+Writes the two hook entries into `~/.claude/settings.json`, at **user** scope rather than project
+scope, so every project gets recorded rather than only the one where you happened to add the hook
+(retrieval is still scoped per project regardless of where the hooks are registered — see below).
+It merges rather than overwrites: every other key already in settings.json, and every other hook
+already registered for those two events, survives untouched. Run it again — after an upgrade, or
+just to check — and it updates the same two entries in place instead of adding duplicates. If
+`~/.claude/settings.json` exists but does not parse as JSON, `install` refuses to touch it and says
+why on stderr, rather than risk overwriting a config it cannot read back.
+
+Trying this from a checkout before the branch is pushed anywhere — for example, from inside a git
+worktree — needs `velox-hook install --local` instead: it points both hook commands at the
+absolute path of the currently running `velox-hook` executable rather than the `uvx --from git+...`
+form, which would otherwise fetch whatever is on the remote branch instead of what is checked out
+here.
+
+`velox-hook uninstall` removes exactly the entries `install` added and leaves everything else
+alone — see "Turning it off" below.
+
+The JSON below is what `install` writes. Hand-editing it is the explicit alternative for anyone
+who would rather see and control every line themselves; note that copying it wholesale over an
+existing `settings.json` destroys everything else in that file, which is exactly what `install`
+exists to avoid.
 
 ```json
 {
@@ -120,10 +143,39 @@ is to set `VELOX_HOOK_KNOWLEDGE_BASE` to the intended knowledge base id.
 
 ## Turning it off
 
-Remove the two entries from `~/.claude/settings.json`. Recorded turns stay: individual documents
-can never be deleted — `/v1/documents/*` is GET-only, and the only deletion the service offers is
-of an entire knowledge base ([docs/mcp.md](mcp.md#a-typical-setup)). Turning the hooks off stops
-new turns from being written; it does not remove the ones already there.
+```
+velox-hook uninstall
+```
+
+Removes the two entries from `~/.claude/settings.json` and leaves every other key, and every other
+hook registered for those two events, alone. Recorded turns stay: individual documents can never be
+deleted — `/v1/documents/*` is GET-only, and the only deletion the service offers is of an entire
+knowledge base ([docs/mcp.md](mcp.md#a-typical-setup)). Turning the hooks off stops new turns from
+being written; it does not remove the ones already there.
+
+## Backfilling from `velox-chat-transcripts`
+
+```
+velox-hook ingest <directory>
+```
+
+Uploads a directory of `<stem>.md` / `<stem>.metadata.json` pairs produced by
+`velox-chat-transcripts` — the batch converter writes the files but has no way to upload them
+itself. For each `.md` file, `ingest` reads its sibling `.metadata.json` and POSTs both together; a
+`.md` file with no metadata sibling is skipped and reported, never uploaded on its own.
+
+**Do not upload a `.md` file without its metadata by any other means.** A document uploaded without
+`channel` in its metadata is invisible to `retrieve`, which filters on `channel` — it will sit in
+the knowledge base, searchable only by the MCP tool `search_memory` with no project filter, and
+never surface from the hook. Because documents cannot be deleted and re-uploading the same content
+later is refused as a `409 DUPLICATE_DOCUMENT`, there is no way to fix it afterwards: the mistake is
+permanent. This has already happened once, from a hand-rolled upload script that sent the `.md`
+without checking for its `.metadata.json`.
+
+`ingest` reports what happened to each file — accepted, duplicate (already indexed, not a failure),
+skipped (no metadata), or failed (with the status code) — and exits non-zero if anything actually
+failed. A `202` means the upload job was queued, not that the document is searchable yet; that
+happens once the ingestion worker finishes.
 
 ## Where to look when something seems wrong
 
