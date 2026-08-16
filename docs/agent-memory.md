@@ -35,11 +35,17 @@ re-run afterwards, because deleting the worktree leaves both hooks pointing at a
 is no longer there.
 
 Note what is deliberately *not* used here: `uvx --from git+...`, the form the MCP server is
-configured with. Measured on one machine, a `uvx` invocation costs about 4.5 seconds every time —
-it re-resolves the git ref and rebuilds the environment on each run, warm cache or not — against
-about 300ms for an installed executable. Once per session, for the MCP server, that is invisible.
-On a hook that runs before every prompt it would sit in front of every question you ask and leave
-little room under `UserPromptSubmit`'s 10-second timeout.
+configured with. Measured on one machine, a `uvx` invocation adds about 4.2 seconds of its own on
+every run, warm cache or not, because it re-resolves the git ref and rebuilds the environment each
+time. Once per session, for the MCP server, that is invisible. On a hook it is paid before every
+prompt, on top of the retrieval itself.
+
+What retrieval itself costs on that machine, for reference: about **800ms** warm — roughly 320ms of
+Python start-up, 240ms of search, and the rest client setup and resolving the knowledge base — and
+about **4.5 seconds** cold, when Ollama has idle-unloaded the embedding model and has to read it
+back in. Ollama's default keep-alive is five minutes, so the first prompt after a break pays the
+cold price and the rest of the session does not. Both fit under `UserPromptSubmit`'s 10-second
+timeout; adding `uvx` to the cold case would not leave much of it.
 
 `velox-hook uninstall` removes exactly the entries `install` added and leaves everything else
 alone — see "Turning it off" below.
