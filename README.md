@@ -120,8 +120,22 @@ More detail, including why two compose defaults hold only locally, is in
 
 Connecting the MCP server only gives the agent tools to search memory; nothing writes to it, and
 searching is left to the agent's own discretion. `velox-hook` is a separate pair of Claude Code
-hooks that records every turn and searches on every prompt automatically — off until you add them,
-and independent of the MCP connection above. See [docs/agent-memory.md](docs/agent-memory.md).
+hooks that record every turn and search on every prompt automatically — off until you add them, and
+independent of the MCP connection above:
+
+```bash
+uv tool install git+https://github.com/ilikebug/veloxrag
+~/.local/bin/velox-hook install
+```
+
+The first line puts a stable executable on disk; the second writes the two hook entries into
+`~/.claude/settings.json`, merging with whatever is already in that file rather than replacing it.
+They take effect in the next session, not the one already running. `velox-hook uninstall` reverses
+it.
+
+What gets recorded and what deliberately does not, how retrieval is scoped to one project, what it
+costs per prompt, and how to backfill history you already have, are all in
+[docs/agent-memory.md](docs/agent-memory.md).
 
 ## Retrieval
 

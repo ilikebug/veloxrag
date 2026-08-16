@@ -175,6 +175,25 @@ being written; it does not remove the ones already there.
 
 ## Backfilling from `velox-chat-transcripts`
 
+Turning the hooks on only starts recording from now on. The sessions you have already had are still
+in `~/.claude/projects`, and converting them gives retrieval something to find on day one rather
+than after a week of accumulation. Two steps, convert then upload:
+
+```
+velox-chat-transcripts --source claude-code --root ~/.claude/projects \
+  --output-directory /tmp/velox-ingest "--project=-Users-you-work-yourproject"
+velox-hook ingest /tmp/velox-ingest
+```
+
+**Note the `=` in `--project=`.** The project name is the directory name Claude Code assigns under
+`~/.claude/projects`, which starts with `-`; written as `--project -Users-...` the parser reads that
+leading dash as the beginning of another option, and the converter exits 1 having printed nothing
+at all. `--project` is optional, and leaving it off converts every project — on a machine holding a
+few hundred sessions that is hours of embedding, so it is worth starting with one.
+
+The converter drops sessions shorter than four turns and de-duplicates turns that a resumed session
+replayed, so it writes fewer documents than you have transcripts, and prints how many.
+
 ```
 velox-hook ingest <directory>
 ```
@@ -196,6 +215,33 @@ without checking for its `.metadata.json`.
 skipped (no metadata), or failed (with the status code) — and exits non-zero if anything actually
 failed. A `202` means the upload job was queued, not that the document is searchable yet; that
 happens once the ingestion worker finishes.
+
+## Confirming it is actually working
+
+Nothing announces itself when this works, which is the point — but it is also indistinguishable
+from nothing happening. After a session in which you asked something substantive, list the
+documents:
+
+```
+curl -s "$RAG_BASE_URL/v1/knowledge-bases/$KB/documents?limit=100" \
+  | python3 -c "import json,sys; [print(d['status'], d['display_name']) for d in json.load(sys.stdin)['items'][-5:]]"
+```
+
+A turn recorded by the hook is named `claude-code-<session id>-<prompt id>.md` — **two** ids. One id
+means the document came from the batch converter instead. If nothing new appears, the likely causes,
+in order: the session predates the install (hooks only apply to sessions started afterwards), the
+answers were under the 200-character threshold, or the stack is not running.
+
+To see retrieval rather than recording, run the hook by hand with the working directory you care
+about:
+
+```
+printf '{"session_id":"probe","prompt_id":"p1","cwd":"'"$PWD"'","user_input":"something you discussed before"}' \
+  | velox-hook retrieve
+```
+
+Empty output means nothing cleared the score floor for that project — which is the correct answer
+in a project with no history yet, and a reason to check `channel` if the project does have some.
 
 ## Where to look when something seems wrong
 
