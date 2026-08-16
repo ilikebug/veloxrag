@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import sys
 import tempfile
@@ -454,7 +455,6 @@ def _log(message: str) -> None:
 # returns non-zero -- see the module docstring for why the two conventions
 # coexist deliberately.
 
-_UVX_BASE_COMMAND: Final = "uvx --from git+https://github.com/ilikebug/veloxrag velox-hook"
 _RETRIEVE_HOOK_TIMEOUT: Final = 10
 _RECORD_HOOK_TIMEOUT: Final = 15
 # What identifies a hook entry as ours, for both idempotent install and
@@ -511,17 +511,31 @@ def _settings_write_mode(path: Path) -> int:
     return 0o666 & ~current_umask
 
 
-def _hook_base_command(*, local: bool) -> str:
-    if not local:
-        return _UVX_BASE_COMMAND
-    # sys.argv[0] of the real process, not whatever argv main() was called
-    # with in a test: --local means "the executable actually running right
-    # now", which is what someone testing from this worktree, before the
-    # branch is pushed anywhere, needs recorded instead of a `uvx` fetch.
-    executable = Path(sys.argv[0]).resolve()
-    if not executable.exists():
-        raise SettingsError(f"--local executable does not exist: {executable}")
-    return str(executable)
+def _hook_base_command() -> str:
+    """The absolute path of the velox-hook that is running right now.
+
+    Deliberately not `uvx --from git+...`, which is what this used to write.
+    Measured on one machine: a uvx invocation costs about 4.5 seconds every
+    single time -- it re-resolves the git ref and rebuilds the environment on
+    each run, warm cache or not -- against about 300ms for an installed
+    executable. That is a fine trade for the MCP server, which starts once per
+    session and stays up, and the wrong one for a hook that runs on every
+    prompt, where it would sit in front of every question the operator asks
+    and leave little room under UserPromptSubmit's 10-second timeout.
+
+    So the command recorded is whichever executable is doing the installing:
+    `uv tool install`'s, this checkout's, a worktree's. Symlinks are not
+    resolved on purpose -- `uv tool install` publishes ~/.local/bin/velox-hook
+    as a link into a store directory that moves when the tool is upgraded, and
+    the link is the stable name of the two.
+    """
+    argv_zero = sys.argv[0]
+    located = os.path.abspath(argv_zero) if os.sep in argv_zero else shutil.which(argv_zero)
+    if not located or not os.path.exists(located):
+        raise SettingsError(
+            f"cannot locate the running velox-hook executable (argv[0]={argv_zero!r})"
+        )
+    return located
 
 
 def _upsert_hook(entries: list[object], *, command: str, timeout: int) -> str:
@@ -529,8 +543,8 @@ def _upsert_hook(entries: list[object], *, command: str, timeout: int) -> str:
 
     Appends a new entry only when none matches. This, not the command string
     itself, is what makes `install` idempotent: run twice, or switch between
-    `--local` and the default form, and the event ends up with exactly one
-    entry rather than a second one alongside the first.
+    installing from a different checkout than last time, and the event ends up
+    with exactly one entry rather than a second one alongside the first.
     """
     for entry in entries:
         if not isinstance(entry, dict):
@@ -547,7 +561,7 @@ def _upsert_hook(entries: list[object], *, command: str, timeout: int) -> str:
     return "added"
 
 
-def install(*, local: bool) -> int:
+def install() -> int:
     """Write or update the two hook entries in `~/.claude/settings.json`.
 
     Loads the file, changes only `hooks.UserPromptSubmit` and `hooks.Stop`,
@@ -563,7 +577,7 @@ def install(*, local: bool) -> int:
         print(f"velox-hook install: {error}", file=sys.stderr)
         return 1
     try:
-        base_command = _hook_base_command(local=local)
+        base_command = _hook_base_command()
     except SettingsError as error:
         print(f"velox-hook install: {error}", file=sys.stderr)
         return 1
@@ -854,12 +868,10 @@ def main(argv: list[str] | None = None) -> int:
     # install/uninstall/ingest never read stdin: they are not hook events, and
     # blocking on stdin would hang a command run directly at a terminal.
     if subcommand == "install":
-        local = "--local" in rest
-        unknown = [arg for arg in rest if arg != "--local"]
-        if unknown:
-            print(f"velox-hook install: unknown argument: {unknown[0]}", file=sys.stderr)
+        if rest:
+            print(f"velox-hook install: unknown argument: {rest[0]}", file=sys.stderr)
             return 1
-        return install(local=local)
+        return install()
     if subcommand == "uninstall":
         if rest:
             print(f"velox-hook uninstall: unknown argument: {rest[0]}", file=sys.stderr)

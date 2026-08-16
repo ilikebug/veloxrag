@@ -21,11 +21,25 @@ just to check — and it updates the same two entries in place instead of adding
 `~/.claude/settings.json` exists but does not parse as JSON, `install` refuses to touch it and says
 why on stderr, rather than risk overwriting a config it cannot read back.
 
-Trying this from a checkout before the branch is pushed anywhere — for example, from inside a git
-worktree — needs `velox-hook install --local` instead: it points both hook commands at the
-absolute path of the currently running `velox-hook` executable rather than the `uvx --from git+...`
-form, which would otherwise fetch whatever is on the remote branch instead of what is checked out
-here.
+What it records is the absolute path of the `velox-hook` executable that is doing the installing.
+Install it once, so that path is stable:
+
+```
+uv tool install git+https://github.com/ilikebug/veloxrag
+~/.local/bin/velox-hook install
+```
+
+Running `install` from a checkout or a git worktree instead points the hooks at that checkout,
+which is what you want while trying a change before it is pushed — and what you must remember to
+re-run afterwards, because deleting the worktree leaves both hooks pointing at an executable that
+is no longer there.
+
+Note what is deliberately *not* used here: `uvx --from git+...`, the form the MCP server is
+configured with. Measured on one machine, a `uvx` invocation costs about 4.5 seconds every time —
+it re-resolves the git ref and rebuilds the environment on each run, warm cache or not — against
+about 300ms for an installed executable. Once per session, for the MCP server, that is invisible.
+On a hook that runs before every prompt it would sit in front of every question you ask and leave
+little room under `UserPromptSubmit`'s 10-second timeout.
 
 `velox-hook uninstall` removes exactly the entries `install` added and leaves everything else
 alone — see "Turning it off" below.
@@ -43,7 +57,7 @@ exists to avoid.
         "hooks": [
           {
             "type": "command",
-            "command": "uvx --from git+https://github.com/ilikebug/veloxrag velox-hook retrieve",
+            "command": "/Users/you/.local/bin/velox-hook retrieve",
             "timeout": 10
           }
         ]
@@ -54,7 +68,7 @@ exists to avoid.
         "hooks": [
           {
             "type": "command",
-            "command": "uvx --from git+https://github.com/ilikebug/veloxrag velox-hook record",
+            "command": "/Users/you/.local/bin/velox-hook record",
             "timeout": 15
           }
         ]

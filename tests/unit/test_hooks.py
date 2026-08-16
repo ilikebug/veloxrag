@@ -767,10 +767,23 @@ def _settings_path(tmp_path: Path) -> Path:
     return tmp_path / ".claude" / "settings.json"
 
 
+def _fake_executable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Stand in for the running velox-hook, whose path install() records.
+
+    Under pytest, argv[0] is pytest's own binary, so a test that does not do
+    this asserts on whatever happens to be running it.
+    """
+    executable = tmp_path / "velox-hook"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [str(executable), "install"])
+    return executable
+
+
 def test_install_into_a_missing_file_creates_it_with_both_events(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    _fake_executable(monkeypatch, tmp_path)
     settings_path = _settings_path(tmp_path)
     assert not settings_path.exists()
 
@@ -819,6 +832,7 @@ def test_install_twice_yields_exactly_one_entry_per_event(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    _fake_executable(monkeypatch, tmp_path)
     settings_path = _settings_path(tmp_path)
 
     main(["install"])
@@ -832,24 +846,54 @@ def test_install_twice_yields_exactly_one_entry_per_event(
     assert len(written["hooks"]["Stop"][0]["hooks"]) == 1
 
 
-def test_install_switching_command_forms_replaces_rather_than_appends(
+def test_installing_from_a_different_executable_replaces_rather_than_appends(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # Moving from a worktree's executable to an installed one is the expected
+    # migration, and it has to leave one entry behind rather than two, or the
+    # turn is recorded twice and the stale path fails on every prompt.
     monkeypatch.setenv("HOME", str(tmp_path))
     settings_path = _settings_path(tmp_path)
-    local_executable = tmp_path / "velox-hook-local"
-    local_executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    monkeypatch.setattr(sys, "argv", [str(local_executable), "install", "--local"])
+    first = tmp_path / "velox-hook-worktree"
+    second = tmp_path / "velox-hook-installed"
+    for executable in (first, second):
+        executable.write_text("#!/bin/sh\n", encoding="utf-8")
 
+    monkeypatch.setattr(sys, "argv", [str(first), "install"])
     main(["install"])
-    code = main(["install", "--local"])
+    monkeypatch.setattr(sys, "argv", [str(second), "install"])
+    code = main(["install"])
 
     assert code == 0
     written = json.loads(settings_path.read_text(encoding="utf-8"))
     assert len(written["hooks"]["UserPromptSubmit"]) == 1
     assert len(written["hooks"]["Stop"]) == 1
-    retrieve_command = written["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-    assert retrieve_command == f"{local_executable.resolve()} retrieve"
+    assert written["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == f"{second} retrieve"
+    assert written["hooks"]["Stop"][0]["hooks"][0]["command"] == f"{second} record"
+
+
+def test_install_records_the_executable_without_resolving_symlinks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `uv tool install` publishes ~/.local/bin/velox-hook as a link into a store
+    # directory that moves when the tool is upgraded. The link is the stable
+    # name of the two, so it is what belongs in settings.json.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings_path = _settings_path(tmp_path)
+    store = tmp_path / "store" / "velox-hook"
+    store.parent.mkdir(parents=True)
+    store.write_text("#!/bin/sh\n", encoding="utf-8")
+    link = tmp_path / "velox-hook"
+    link.symlink_to(store)
+    monkeypatch.setattr(sys, "argv", [str(link), "install"])
+
+    code = main(["install"])
+
+    assert code == 0
+    written = json.loads(settings_path.read_text(encoding="utf-8"))
+    command = written["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+    assert command == f"{link} retrieve"
+    assert str(store) not in command
 
 
 def test_install_refuses_an_unparseable_file(
@@ -887,6 +931,7 @@ def test_uninstall_removes_only_velox_hook_entries(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    _fake_executable(monkeypatch, tmp_path)
     settings_path = _settings_path(tmp_path)
     settings_path.parent.mkdir(parents=True)
     settings_path.write_text(
@@ -1005,9 +1050,9 @@ def test_ingest_fails_loudly_when_no_knowledge_base_resolves(
 
 
 def test_the_console_script_points_at_this_module() -> None:
-    # The hook is configured in settings.json as `uvx ... velox-hook`, so the
-    # entry point is the whole interface. A rename here is a broken hook there,
-    # with nothing to say why.
+    # settings.json holds the path of a `velox-hook` executable, so the entry
+    # point is the whole interface. A rename here is a broken hook there, with
+    # nothing to say why.
     manifest = tomllib.loads(
         (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8")
     )
