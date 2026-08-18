@@ -776,7 +776,7 @@ def retrieve(payload: dict[str, object], settings: HookSettings) -> str:
     """
     session_id = _text(payload, "session_id")
     prompt_id = _text(payload, "prompt_id")
-    user_input = _text(payload, "user_input").strip()
+    user_input = _text(payload, "prompt").strip()
     if not user_input or user_input.startswith("/"):
         return ""
     if session_id and prompt_id:

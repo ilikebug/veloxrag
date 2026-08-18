@@ -437,7 +437,7 @@ _RETRIEVE_PAYLOAD: dict[str, object] = {
     "session_id": "session-1",
     "prompt_id": "prompt-1",
     "cwd": "/tmp/project",
-    "user_input": "why is the schedule per carrier",
+    "prompt": "why is the schedule per carrier",
 }
 
 
@@ -517,7 +517,7 @@ def test_retrieve_skips_a_slash_command_without_calling_the_service(
     recorder = _Recorder()
     _install(monkeypatch, recorder)
 
-    code, out = _run(monkeypatch, "retrieve", {**_RETRIEVE_PAYLOAD, "user_input": "/clear"}, capsys)
+    code, out = _run(monkeypatch, "retrieve", {**_RETRIEVE_PAYLOAD, "prompt": "/clear"}, capsys)
 
     assert code == 0
     assert out == ""
@@ -532,7 +532,7 @@ def test_retrieve_truncates_a_question_past_the_api_limit(
     recorder = _Recorder(httpx.Response(200, json={"results": []}))
     _install(monkeypatch, recorder)
 
-    _run(monkeypatch, "retrieve", {**_RETRIEVE_PAYLOAD, "user_input": "q" * 9000}, capsys)
+    _run(monkeypatch, "retrieve", {**_RETRIEVE_PAYLOAD, "prompt": "q" * 9000}, capsys)
 
     assert len(json.loads(recorder.requests[0].content)["query"]) == 8000
 

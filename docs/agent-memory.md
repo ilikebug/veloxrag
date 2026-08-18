@@ -236,7 +236,7 @@ To see retrieval rather than recording, run the hook by hand with the working di
 about:
 
 ```
-printf '{"session_id":"probe","prompt_id":"p1","cwd":"'"$PWD"'","user_input":"something you discussed before"}' \
+printf '{"session_id":"probe","prompt_id":"p1","cwd":"'"$PWD"'","prompt":"something you discussed before"}' \
   | velox-hook retrieve
 ```
 
