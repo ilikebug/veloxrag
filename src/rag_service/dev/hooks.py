@@ -816,11 +816,24 @@ def record(payload: dict[str, object], settings: HookSettings) -> None:
     prompt_id = _text(payload, "prompt_id")
     assistant_text = _text(payload, "last_assistant_message")
     if not session_id or not prompt_id or not assistant_text:
+        # Names only, never values: a payload the hook cannot use is worth
+        # reporting, the conversation inside it is not.
+        missing = ", ".join(
+            name
+            for name, value in (
+                ("session_id", session_id),
+                ("prompt_id", prompt_id),
+                ("last_assistant_message", assistant_text),
+            )
+            if not value
+        )
+        _log(f"record skipped the turn: the Stop payload has no {missing}")
         return
     user_input = take_prompt(session_id, prompt_id)
     if user_input is None:
         # The question was never stored, so UserPromptSubmit did not run or could
         # not write. Half a turn is not worth indexing.
+        _log("record skipped the turn: no stored question for this prompt")
         return
     if not should_record(user_input, assistant_text, minimum=settings.minimum_answer_characters):
         return
