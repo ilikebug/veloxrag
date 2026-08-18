@@ -462,12 +462,26 @@ _RECORD_HOOK_TIMEOUT: Final = 15
 _HOOK_MARKER: Final = "velox-hook"
 
 
+# The agents this installs into, and the file each keeps its hooks in. Both use
+# the same structure -- a "hooks" object keyed by event name, each event holding
+# entries of {"hooks": [{"type": "command", ...}]} -- and the same payload field
+# names, so install and uninstall are written once and pointed at one of these.
+# Codex additionally requires the operator to trust a hook command before it
+# will run it; see the note install() prints.
+_AGENT_HOOK_FILES: Final = {
+    "claude": (".claude", "settings.json"),
+    "codex": (".codex", "hooks.json"),
+}
+_DEFAULT_AGENT: Final = "claude"
+
+
 class SettingsError(Exception):
-    """`~/.claude/settings.json` could not be safely read or written."""
+    """An agent's hook config could not be safely read or written."""
 
 
-def _settings_path() -> Path:
-    return Path.home() / ".claude" / "settings.json"
+def _settings_path(agent: str = _DEFAULT_AGENT) -> Path:
+    directory, filename = _AGENT_HOOK_FILES[agent]
+    return Path.home() / directory / filename
 
 
 def _read_settings(path: Path) -> dict[str, object]:
@@ -561,8 +575,8 @@ def _upsert_hook(entries: list[object], *, command: str, timeout: int) -> str:
     return "added"
 
 
-def install() -> int:
-    """Write or update the two hook entries in `~/.claude/settings.json`.
+def install(agent: str = _DEFAULT_AGENT) -> int:
+    """Write or update the two hook entries in the agent's hook config.
 
     Loads the file, changes only `hooks.UserPromptSubmit` and `hooks.Stop`,
     and writes the whole structure back -- every other key, and every other
@@ -570,7 +584,7 @@ def install() -> int:
     replaces the documented copy-paste snippet, which is a complete JSON
     document and destroys the rest of settings.json when pasted over it.
     """
-    path = _settings_path()
+    path = _settings_path(agent)
     try:
         settings = _read_settings(path)
     except SettingsError as error:
@@ -615,17 +629,27 @@ def install() -> int:
         print(f"created {path}")
     for event, action, command in changes:
         print(f"{action} {event} hook: {command}")
+    if agent == "codex":
+        # Registering a hook with Codex is not the same as arming it: it pins a
+        # sha256 of each command and refuses to run one it has not been trusted
+        # with, reporting it as untrusted rather than failing loudly. An
+        # operator who stops at this command gets two entries that exist, look
+        # right, and never fire -- so say the remaining step out loud.
+        print(
+            "codex trusts hook commands by hash: start codex and approve these "
+            "two entries, or they stay registered and silent"
+        )
     return 0
 
 
-def uninstall() -> int:
-    """Remove only the velox-hook entries from `~/.claude/settings.json`.
+def uninstall(agent: str = _DEFAULT_AGENT) -> int:
+    """Remove only the velox-hook entries from the agent's hook config.
 
     Prunes empty structure left behind -- an entry whose hooks list becomes
     empty, an event whose entry list becomes empty, and the `hooks` key itself
     -- but never touches a hook belonging to something else.
     """
-    path = _settings_path()
+    path = _settings_path(agent)
     try:
         settings = _read_settings(path)
     except SettingsError as error:
@@ -768,6 +792,17 @@ def _text(payload: dict[str, object], key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _turn_key(payload: dict[str, object]) -> str:
+    """The id that pairs a question with the answer that follows it.
+
+    Claude Code calls it prompt_id; Codex calls the same thing turn_id and has
+    no prompt_id at all. Accepting either is what lets one state file, and one
+    retrieve/record pair, serve both agents -- and getting this wrong is silent
+    on both, since a turn without an id is simply never recorded.
+    """
+    return _text(payload, "prompt_id") or _text(payload, "turn_id")
+
+
 def retrieve(payload: dict[str, object], settings: HookSettings) -> str:
     """Return the text to print, or the empty string.
 
@@ -775,7 +810,7 @@ def retrieve(payload: dict[str, object], settings: HookSettings) -> str:
     cost this turn its retrieval, not also its recording.
     """
     session_id = _text(payload, "session_id")
-    prompt_id = _text(payload, "prompt_id")
+    prompt_id = _turn_key(payload)
     user_input = _text(payload, "prompt").strip()
     if not user_input or user_input.startswith("/"):
         return ""
@@ -813,7 +848,7 @@ def record(payload: dict[str, object], settings: HookSettings) -> None:
     """Upload the turn that just finished, or decide it is not worth keeping."""
     prune_stale_state()
     session_id = _text(payload, "session_id")
-    prompt_id = _text(payload, "prompt_id")
+    prompt_id = _turn_key(payload)
     assistant_text = _text(payload, "last_assistant_message")
     if not session_id or not prompt_id or not assistant_text:
         # Names only, never values: a payload the hook cannot use is worth
@@ -822,7 +857,7 @@ def record(payload: dict[str, object], settings: HookSettings) -> None:
             name
             for name, value in (
                 ("session_id", session_id),
-                ("prompt_id", prompt_id),
+                ("prompt_id/turn_id", prompt_id),
                 ("last_assistant_message", assistant_text),
             )
             if not value
@@ -880,16 +915,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # install/uninstall/ingest never read stdin: they are not hook events, and
     # blocking on stdin would hang a command run directly at a terminal.
-    if subcommand == "install":
-        if rest:
-            print(f"velox-hook install: unknown argument: {rest[0]}", file=sys.stderr)
-            return 1
-        return install()
-    if subcommand == "uninstall":
-        if rest:
-            print(f"velox-hook uninstall: unknown argument: {rest[0]}", file=sys.stderr)
-            return 1
-        return uninstall()
+    if subcommand in {"install", "uninstall"}:
+        agent = _DEFAULT_AGENT
+        for argument in rest:
+            candidate = argument.removeprefix("--")
+            if candidate not in _AGENT_HOOK_FILES or candidate == argument:
+                print(
+                    f"velox-hook {subcommand}: unknown argument: {argument} "
+                    f"(expected one of {', '.join('--' + name for name in _AGENT_HOOK_FILES)})",
+                    file=sys.stderr,
+                )
+                return 1
+            agent = candidate
+        return install(agent) if subcommand == "install" else uninstall(agent)
     if subcommand == "ingest":
         if len(rest) != 1:
             print("velox-hook ingest: usage: velox-hook ingest <directory>", file=sys.stderr)

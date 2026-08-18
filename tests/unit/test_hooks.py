@@ -973,6 +973,104 @@ def test_uninstall_with_nothing_to_remove_says_so_and_leaves_the_file_valid(
     assert "nothing to remove" in capsys.readouterr().out
 
 
+def test_install_codex_writes_the_same_shape_into_the_codex_hook_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _fake_executable(monkeypatch, tmp_path)
+    codex_path = tmp_path / ".codex" / "hooks.json"
+
+    code = main(["install", "--codex"])
+
+    assert code == 0
+    assert not _settings_path(tmp_path).exists()
+    written = json.loads(codex_path.read_text(encoding="utf-8"))
+    assert written["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].endswith("retrieve")
+    assert written["hooks"]["Stop"][0]["hooks"][0]["command"].endswith("record")
+    # The trust gate is silent when it bites, so installing must name it.
+    assert "trusts hook commands by hash" in capsys.readouterr().out
+
+
+def test_install_codex_preserves_hooks_another_tool_registered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _fake_executable(monkeypatch, tmp_path)
+    codex_path = tmp_path / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    codex_path.write_text(
+        json.dumps({"hooks": {"UserPromptSubmit": [{"hooks": [{"command": "other-tool"}]}]}}),
+        encoding="utf-8",
+    )
+
+    assert main(["install", "--codex"]) == 0
+
+    written = json.loads(codex_path.read_text(encoding="utf-8"))
+    commands = [h["command"] for e in written["hooks"]["UserPromptSubmit"] for h in e["hooks"]]
+    assert "other-tool" in commands
+    assert any(c.endswith("retrieve") for c in commands)
+    capsys.readouterr()
+
+
+def test_uninstall_codex_touches_only_the_codex_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _fake_executable(monkeypatch, tmp_path)
+    assert main(["install"]) == 0
+    assert main(["install", "--codex"]) == 0
+
+    assert main(["uninstall", "--codex"]) == 0
+
+    codex = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    claude = json.loads(_settings_path(tmp_path).read_text(encoding="utf-8"))
+    assert "hooks" not in codex
+    assert claude["hooks"]["Stop"][0]["hooks"][0]["command"].endswith("record")
+    capsys.readouterr()
+
+
+def test_install_rejects_an_unknown_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _fake_executable(monkeypatch, tmp_path)
+
+    code = main(["install", "--cursor"])
+
+    assert code == 1
+    assert "unknown argument: --cursor" in capsys.readouterr().err
+    assert not _settings_path(tmp_path).exists()
+
+
+def test_a_turn_is_paired_by_turn_id_when_there_is_no_prompt_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Codex sends turn_id and has no prompt_id; the pairing must survive that,
+    # or every turn in Codex is dropped exactly the way it was in Claude Code.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    recorder = _Recorder(httpx.Response(200, json={"results": []}), httpx.Response(202, json={}))
+    _install(monkeypatch, recorder)
+    codex_prompt: dict[str, object] = {
+        "session_id": "codex-session",
+        "turn_id": "turn-7",
+        "cwd": "/tmp/project",
+        "prompt": "why is the schedule per carrier",
+    }
+
+    _run(monkeypatch, "retrieve", codex_prompt, capsys)
+    _run(
+        monkeypatch,
+        "record",
+        {**codex_prompt, "last_assistant_message": "b" * 400},
+        capsys,
+    )
+
+    uploaded = recorder.requests[-1]
+    assert "documents" in str(uploaded.url)
+    assert "codex-session-turn-7" in uploaded.content.decode("utf-8", "replace")
+
+
 def _write_transcript_pair(directory: Path, stem: str, *, with_metadata: bool = True) -> None:
     (directory / f"{stem}.md").write_text(f"# {stem}\n\nbody text\n", encoding="utf-8")
     if with_metadata:

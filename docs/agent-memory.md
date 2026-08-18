@@ -104,6 +104,37 @@ directory and therefore its own channel, so a turn recorded inside a worktree is
 default from the main checkout. To search across every project regardless of channel, ask the
 agent to call the MCP tool `search_memory` directly — it applies no channel filter.
 
+## Codex
+
+Codex keeps hooks in `~/.codex/hooks.json`, under the same `{"hooks": {"<Event>": [{"hooks":
+[...]}]}}` structure Claude Code uses in `settings.json`, fires the same `UserPromptSubmit` and
+`Stop` events, and sends the same payload field names — with one exception: the id pairing a
+question with its answer is `turn_id` there and `prompt_id` in Claude Code. Both are accepted, so
+one install serves either agent:
+
+```
+velox-hook install --codex
+```
+
+`--claude` is the default and keeps the existing behaviour. `uninstall` takes the same flag and
+touches only that agent's file.
+
+One extra step belongs to Codex alone. It pins a sha256 of every hook command and **will not run a
+command it has not been trusted with** — reporting it as `untrusted` rather than failing, so a hook
+that was never approved is registered, looks correct, and silently never fires. Approve the two
+entries in Codex after installing. To see what Codex thinks it has, ask it rather than reading the
+file:
+
+```
+{ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"c","title":"c","version":"0"}}}'; \
+  printf '%s\n' '{"jsonrpc":"2.0","method":"initialized","params":{}}'; \
+  printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"hooks/list","params":{"cwd":"'"$PWD"'"}}'; sleep 3; } \
+  | codex app-server
+```
+
+Each entry comes back with `enabled` and `trustStatus`; the trust decisions themselves live in
+`~/.codex/config.toml` under `[hooks.state."<file>:<event>:<i>:<j>"]` as a `trusted_hash`.
+
 ## What gets recorded, and what does not
 
 One document per turn: the question and the answer only, nothing else. Not the reasoning, not
