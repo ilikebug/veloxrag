@@ -88,7 +88,10 @@ exists to avoid.
 a state file, searches the knowledge base scoped to the current project, and prints surviving
 passages on stdout, which Claude Code adds to that turn's context. `record` runs on `Stop`: it
 reads `last_assistant_message` from the payload, pairs it with the stored question by `prompt_id`,
-and uploads the turn as one Markdown document.
+and uploads the turn as one Markdown document. A turn whose last step is a tool call arrives with
+no `last_assistant_message`; for those, `record` reads the turn's text back from the transcript at
+`transcript_path`, taking only lines after the turn's own `promptId` and skipping sidechain lines,
+and only when that path is a `.jsonl` under `~/.claude/projects`.
 
 Both are advisory. Every failure path — service down, Ollama down, a timeout, a non-200 response,
 a malformed payload, no knowledge base resolvable — prints nothing and exits 0: the session is
@@ -187,10 +190,15 @@ guessing, and both hooks go quiet.** Resolving "the" knowledge base only works w
 exists; with several, guessing wrong means searching or writing to the wrong memory, so the hook
 disables itself for that invocation instead. Nothing on screen announces this — `retrieve` stops
 injecting passages and `record` stops uploading turns, and each writes exactly one line to
-`~/.veloxrag/hook.log` per call: `retrieve found no single knowledge base; set
-VELOX_HOOK_KNOWLEDGE_BASE` and `record found no single knowledge base; set
-VELOX_HOOK_KNOWLEDGE_BASE`, so the log makes clear that both halves stopped, not just one. The fix
-is to set `VELOX_HOOK_KNOWLEDGE_BASE` to the intended knowledge base id.
+`~/.veloxrag/hook.log` per call: `retrieve found 2 knowledge bases; set VELOX_HOOK_KNOWLEDGE_BASE
+to pick one` and the same line starting `record`, so the log makes clear that both halves stopped,
+not just one. The fix is to set `VELOX_HOOK_KNOWLEDGE_BASE` to the intended knowledge base id.
+
+The other ways resolution fails say so instead: `could not list knowledge bases: the service
+answered 500` means the service is up but broken (a datastore container down, typically), and
+`found no knowledge base` means bootstrap never ran. A failed search logs `retrieve search failed
+with <status>`. An earlier version logged the configuration hint for all of these, and a stack
+whose datastores had stopped was read as a configuration problem for eight days.
 
 ## Turning it off
 

@@ -24,12 +24,13 @@ would have made it retrievable, permanently, because documents cannot be
 deleted and the same content re-uploaded is refused as a 409 duplicate. So
 these three fail loudly: a clear message on stderr and a non-zero exit.
 
-Neither hook reads the transcript. The hook payload carries
+The hooks prefer the payload to the transcript. Stop carries
 `last_assistant_message` for the turn that just ended, and the documentation
 says to prefer it because the transcript lags; the two events share a
 `prompt_id`, so the question can be handed from one to the other through a state
-file. Not reading the transcript also sidesteps its replay duplication — a
-resumed session rewrites earlier turns into a new file.
+file. The one exception is a turn whose last step is a tool call: its payload
+has no final message, so record reads that turn's text back from the transcript,
+scoped to the turn's `promptId` so a resumed session's replay cannot leak in.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ from typing import Final
 
 import httpx
 
-from rag_service.dev.chat_transcripts import _demote_headings, _language_of, redact
+from rag_service.dev.chat_transcripts import _blocks_text, _demote_headings, _language_of, redact
 
 _STATE_TTL_SECONDS: Final = 24 * 60 * 60
 _STATE_FILE_MODE: Final = 0o600
@@ -417,23 +418,37 @@ def build_client(settings: HookSettings) -> httpx.Client:
     )
 
 
-def resolve_knowledge_base(settings: HookSettings, client: httpx.Client) -> str | None:
+class KnowledgeBaseUnresolved(Exception):
+    """Why this invocation has no knowledge base, worded for the hook log."""
+
+
+def resolve_knowledge_base(settings: HookSettings, client: httpx.Client) -> str:
     """Find the knowledge base when none was named.
 
-    Unambiguous only when there is exactly one. With several, returning None
+    Unambiguous only when there is exactly one. With several, giving up
     disables the hook for this invocation, which is better than searching or
-    writing to the wrong memory.
+    writing to the wrong memory. Each way of giving up says which it was: one
+    message for all of them once blamed configuration for a service that was
+    down, and the log was read and believed for eight days.
     """
     if settings.knowledge_base_id is not None:
         return settings.knowledge_base_id
     response = client.get("/v1/knowledge-bases")
     if response.status_code != 200:
-        return None
+        raise KnowledgeBaseUnresolved(
+            f"could not list knowledge bases: the service answered {response.status_code}"
+        )
     items = response.json().get("items", ())
+    if not items:
+        raise KnowledgeBaseUnresolved("found no knowledge base")
     if len(items) != 1:
-        return None
+        raise KnowledgeBaseUnresolved(
+            f"found {len(items)} knowledge bases; set VELOX_HOOK_KNOWLEDGE_BASE to pick one"
+        )
     identifier = items[0].get("id")
-    return None if identifier is None else str(identifier)
+    if identifier is None:
+        raise KnowledgeBaseUnresolved("found a knowledge base with no id")
+    return str(identifier)
 
 
 def _log(message: str) -> None:
@@ -724,12 +739,10 @@ def ingest(directory: Path) -> int:
     settings = HookSettings(dict(os.environ))
     accepted = duplicate = skipped = failed = 0
     with build_client(settings) as client:
-        knowledge_base_id = resolve_knowledge_base(settings, client)
-        if knowledge_base_id is None:
-            print(
-                "velox-hook ingest: no knowledge base resolved; set VELOX_HOOK_KNOWLEDGE_BASE",
-                file=sys.stderr,
-            )
+        try:
+            knowledge_base_id = resolve_knowledge_base(settings, client)
+        except KnowledgeBaseUnresolved as error:
+            print(f"velox-hook ingest: {error}", file=sys.stderr)
             return 1
 
         markdown_paths = sorted(directory.glob("*.md"))
@@ -820,9 +833,10 @@ def retrieve(payload: dict[str, object], settings: HookSettings) -> str:
         except OSError as error:
             _log(f"retrieve could not store the prompt: {error}")
     with build_client(settings) as client:
-        knowledge_base_id = resolve_knowledge_base(settings, client)
-        if knowledge_base_id is None:
-            _log("retrieve found no single knowledge base; set VELOX_HOOK_KNOWLEDGE_BASE")
+        try:
+            knowledge_base_id = resolve_knowledge_base(settings, client)
+        except KnowledgeBaseUnresolved as error:
+            _log(f"retrieve {error}")
             return ""
         response = client.post(
             f"/v1/knowledge-bases/{knowledge_base_id}/search",
@@ -839,9 +853,52 @@ def retrieve(payload: dict[str, object], settings: HookSettings) -> str:
             },
         )
     if response.status_code != 200:
+        _log(f"retrieve search failed with {response.status_code}")
         return ""
     results = response.json().get("results", ())
     return render_injection(list(results), floor=settings.score_floor)
+
+
+def _answer_from_transcript(transcript_path: str, prompt_id: str) -> str:
+    """The text this turn said, for a Stop payload that carries none.
+
+    Only a transcript under the agent's own projects directory is read: the path
+    arrives in the payload, and the hook has no business opening anything else.
+    Lines before the turn's own prompt are a previous turn or a resumed
+    session's replay, and sidechain lines are a subagent talking to the agent,
+    not to the user; both are left out.
+    """
+    if not transcript_path or not prompt_id:
+        return ""
+    projects = (Path.home() / ".claude" / "projects").resolve()
+    try:
+        path = Path(transcript_path).resolve()
+    except (OSError, ValueError):
+        return ""
+    if path.suffix != ".jsonl" or not path.is_relative_to(projects):
+        return ""
+    parts: list[str] = []
+    in_turn = False
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for raw in stream:
+                try:
+                    line = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(line, dict):
+                    continue
+                if line.get("type") == "user" and line.get("promptId"):
+                    in_turn = line.get("promptId") == prompt_id
+                    continue
+                if not in_turn or line.get("type") != "assistant" or line.get("isSidechain"):
+                    continue
+                message = line.get("message")
+                if isinstance(message, dict) and (text := _blocks_text(message.get("content"))):
+                    parts.append(text)
+    except OSError:
+        return ""
+    return "\n\n".join(parts)
 
 
 def record(payload: dict[str, object], settings: HookSettings) -> None:
@@ -849,7 +906,9 @@ def record(payload: dict[str, object], settings: HookSettings) -> None:
     prune_stale_state()
     session_id = _text(payload, "session_id")
     prompt_id = _turn_key(payload)
-    assistant_text = _text(payload, "last_assistant_message")
+    assistant_text = _text(payload, "last_assistant_message") or _answer_from_transcript(
+        _text(payload, "transcript_path"), prompt_id
+    )
     if not session_id or not prompt_id or not assistant_text:
         # Names only, never values: a payload the hook cannot use is worth
         # reporting, the conversation inside it is not.
@@ -892,9 +951,10 @@ def record(payload: dict[str, object], settings: HookSettings) -> None:
     )
     display_name = f"claude-code-{session_id}-{prompt_id}.md"
     with build_client(settings) as client:
-        knowledge_base_id = resolve_knowledge_base(settings, client)
-        if knowledge_base_id is None:
-            _log("record found no single knowledge base; set VELOX_HOOK_KNOWLEDGE_BASE")
+        try:
+            knowledge_base_id = resolve_knowledge_base(settings, client)
+        except KnowledgeBaseUnresolved as error:
+            _log(f"record {error}")
             return
         response = client.post(
             f"/v1/knowledge-bases/{knowledge_base_id}/documents",
@@ -952,6 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "HookSettings",
+    "KnowledgeBaseUnresolved",
     "SettingsError",
     "build_client",
     "build_turn_metadata",

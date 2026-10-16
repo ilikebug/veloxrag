@@ -13,6 +13,7 @@ import pytest
 
 from rag_service.dev.hooks import (
     HookSettings,
+    KnowledgeBaseUnresolved,
     build_client,
     build_turn_metadata,
     channel_for,
@@ -364,7 +365,8 @@ def test_several_knowledge_bases_are_not_guessed_between() -> None:
 
     client = httpx.Client(base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(handle))
 
-    assert resolve_knowledge_base(HookSettings({}), client) is None
+    with pytest.raises(KnowledgeBaseUnresolved, match="VELOX_HOOK_KNOWLEDGE_BASE"):
+        resolve_knowledge_base(HookSettings({}), client)
 
 
 def test_a_configured_knowledge_base_is_not_looked_up() -> None:
@@ -383,7 +385,22 @@ def test_an_error_listing_knowledge_bases_resolves_to_nothing() -> None:
 
     client = httpx.Client(base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(handle))
 
-    assert resolve_knowledge_base(HookSettings({}), client) is None
+    # The status, not the configuration hint: a service that is down is not
+    # fixed by naming a knowledge base, and saying so sent a reader of the log
+    # after the wrong problem for eight days.
+    with pytest.raises(KnowledgeBaseUnresolved, match="503") as raised:
+        resolve_knowledge_base(HookSettings({}), client)
+    assert "VELOX_HOOK_KNOWLEDGE_BASE" not in str(raised.value)
+
+
+def test_an_empty_knowledge_base_list_says_there_is_none() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": []})
+
+    client = httpx.Client(base_url="http://127.0.0.1:8000", transport=httpx.MockTransport(handle))
+
+    with pytest.raises(KnowledgeBaseUnresolved, match="no knowledge base"):
+        resolve_knowledge_base(HookSettings({}), client)
 
 
 def test_no_authorization_header_is_sent_when_no_token_is_configured() -> None:
@@ -583,6 +600,34 @@ def test_retrieve_logs_when_no_knowledge_base_can_be_resolved(
 
     logged = (tmp_path / ".veloxrag" / "hook.log").read_text(encoding="utf-8")
     assert "VELOX_HOOK_KNOWLEDGE_BASE" in logged
+
+
+def test_retrieve_logs_the_status_when_the_service_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("VELOX_HOOK_KNOWLEDGE_BASE", raising=False)
+    _install(monkeypatch, _Recorder(httpx.Response(500, json={"detail": "boom"})))
+
+    _run(monkeypatch, "retrieve", _RETRIEVE_PAYLOAD, capsys)
+
+    logged = (tmp_path / ".veloxrag" / "hook.log").read_text(encoding="utf-8")
+    assert "500" in logged
+    assert "VELOX_HOOK_KNOWLEDGE_BASE" not in logged
+
+
+def test_retrieve_logs_a_failed_search(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    _install(monkeypatch, _Recorder(httpx.Response(503, json={"detail": "embedding down"})))
+
+    code, out = _run(monkeypatch, "retrieve", _RETRIEVE_PAYLOAD, capsys)
+
+    assert (code, out) == (0, "")
+    logged = (tmp_path / ".veloxrag" / "hook.log").read_text(encoding="utf-8")
+    assert "retrieve search failed with 503" in logged
 
 
 def test_an_unknown_subcommand_is_logged_and_survived(
@@ -1156,3 +1201,82 @@ def test_the_console_script_points_at_this_module() -> None:
     )
 
     assert manifest["project"]["scripts"]["velox-hook"] == "rag_service.dev.hooks:main"
+
+
+def _write_transcript(home: Path, lines: list[dict[str, object]]) -> Path:
+    path = home / ".claude" / "projects" / "-tmp-project" / "session-1.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    return path
+
+
+def _assistant(text: str, **extra: object) -> dict[str, object]:
+    return {
+        "type": "assistant",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+        **extra,
+    }
+
+
+def _record_payload_without_answer(transcript: Path) -> dict[str, object]:
+    payload = {key: value for key, value in _RECORD_PAYLOAD.items()}
+    del payload["last_assistant_message"]
+    payload["transcript_path"] = str(transcript)
+    return payload
+
+
+def test_record_reads_the_answer_from_the_transcript_when_the_turn_ended_on_a_tool_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A turn whose last step is a tool call (a question box, say) arrives with
+    # no last_assistant_message, though it said plenty along the way.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    remember_prompt("session-1", "prompt-1", "why is the schedule per carrier")
+    transcript = _write_transcript(
+        tmp_path,
+        [
+            {"type": "user", "promptId": "prompt-0", "message": {"role": "user", "content": "x"}},
+            _assistant("an answer to the previous question"),
+            {"type": "user", "promptId": "prompt-1", "message": {"role": "user", "content": "q"}},
+            _assistant("from a subagent", isSidechain=True),
+            _assistant(_LONG_ANSWER),
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "x"}]},
+            },
+        ],
+    )
+    recorder = _Recorder(httpx.Response(202, json={"job_id": "job-1"}))
+    _install(monkeypatch, recorder)
+
+    _run(monkeypatch, "record", _record_payload_without_answer(transcript), capsys)
+
+    body = recorder.requests[0].content.decode("utf-8")
+    assert "The knowledge base refuses a second generation." in body
+    assert "an answer to the previous question" not in body
+    assert "from a subagent" not in body
+
+
+def test_record_does_not_read_a_transcript_outside_the_agent_projects_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    remember_prompt("session-1", "prompt-1", "why is the schedule per carrier")
+    elsewhere = tmp_path / "elsewhere.jsonl"
+    elsewhere.write_text(
+        json.dumps({"type": "user", "promptId": "prompt-1"})
+        + "\n"
+        + json.dumps(_assistant(_LONG_ANSWER))
+        + "\n",
+        encoding="utf-8",
+    )
+    recorder = _Recorder()
+    _install(monkeypatch, recorder)
+
+    _run(monkeypatch, "record", _record_payload_without_answer(elsewhere), capsys)
+
+    assert recorder.requests == []
+    logged = (tmp_path / "home" / ".veloxrag" / "hook.log").read_text(encoding="utf-8")
+    assert "last_assistant_message" in logged
