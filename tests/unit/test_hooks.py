@@ -554,6 +554,23 @@ def test_retrieve_truncates_a_question_past_the_api_limit(
     assert len(json.loads(recorder.requests[0].content)["query"]) == 8000
 
 
+def test_retrieve_keeps_a_long_chinese_question_within_the_embedding_byte_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The embedding gate counts UTF-8 bytes, not codepoints: 2800 CJK characters
+    # are 8400 bytes, past its 8192 limit, and the search fails with a 503.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VELOX_HOOK_KNOWLEDGE_BASE", _KNOWLEDGE_BASE_ID)
+    recorder = _Recorder(httpx.Response(200, json={"results": []}))
+    _install(monkeypatch, recorder)
+
+    _run(monkeypatch, "retrieve", {**_RETRIEVE_PAYLOAD, "prompt": "根因" * 1400}, capsys)
+
+    query = json.loads(recorder.requests[0].content)["query"]
+    assert len(query.encode("utf-8")) <= 8000
+    assert query == "根因" * 1333
+
+
 def test_retrieve_survives_a_payload_that_is_not_json(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

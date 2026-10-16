@@ -74,9 +74,11 @@ _MIN_ANSWER_CHARACTERS: Final = 0
 # tell the user why retrieval simply stopped working.
 _MIN_TOP_K: Final = 1
 _MAX_TOP_K: Final = 50
-# The API's own query limit. A longer prompt is truncated rather than refused:
-# the first 8000 codepoints of a long question still retrieve something useful.
-_MAX_QUERY_CODEPOINTS: Final = 8000
+# A longer prompt is truncated rather than refused: its head still retrieves
+# something useful. Bytes, not codepoints: the API takes 8000 codepoints, but the
+# embedding gate counts UTF-8 bytes against 8192, so 2800 CJK characters pass the
+# first and fail the second with a 503. 8000 bytes satisfies both.
+_MAX_QUERY_BYTES: Final = 8000
 
 _INJECTION_PREAMBLE: Final = (
     "Passages below were retrieved from your own past sessions. They may be "
@@ -816,6 +818,11 @@ def _turn_key(payload: dict[str, object]) -> str:
     return _text(payload, "prompt_id") or _text(payload, "turn_id")
 
 
+def _truncate_to_bytes(text: str, limit: int) -> str:
+    """Cut on a character boundary so the UTF-8 encoding fits in `limit` bytes."""
+    return text.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+
+
 def retrieve(payload: dict[str, object], settings: HookSettings) -> str:
     """Return the text to print, or the empty string.
 
@@ -841,7 +848,7 @@ def retrieve(payload: dict[str, object], settings: HookSettings) -> str:
         response = client.post(
             f"/v1/knowledge-bases/{knowledge_base_id}/search",
             json={
-                "query": user_input[:_MAX_QUERY_CODEPOINTS],
+                "query": _truncate_to_bytes(user_input, _MAX_QUERY_BYTES),
                 "top_k": settings.top_k,
                 "rerank": False,
                 "filters": {
