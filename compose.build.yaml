@@ -29,6 +29,9 @@ services:
   embedding-tls-init:
     build: *velox-build
     image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}
+  embedding-tls-renew:
+    build: *velox-build
+    image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}
   provider-tls-init:
     build: *velox-build
     image: ${VELOX_IMAGE:-veloxrag}:${VELOX_IMAGE_TAG:-local}

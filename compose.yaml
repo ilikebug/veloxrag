@@ -227,11 +227,44 @@ services:
         # with retryable set, and neither the proxy nor the model logs anything,
         # because the client rejects the certificate before sending a request.
         "--reuse-existing",
+        # Keeping the CA key is what lets embedding-tls-renew re-sign the
+        # 7-day server certificate under the same CA, so clients that loaded
+        # the CA once keep trusting the proxy across renewals.
+        "--ca-key-directory",
+        "/run/rag/embedding-ca-key",
       ]
     volumes:
       - embedding_ca:/run/rag/embedding-ca
+      - embedding_ca_key:/run/rag/embedding-ca-key
       - embedding_server_tls:/run/rag/embedding-server-tls
     restart: "no"
+
+  # The init above runs only on `up`, and a stack left running outlives the
+  # 7-day server certificate: measured, the proxy kept serving an expired one
+  # for three weeks and every embedding call failed. This re-runs the same
+  # idempotent generator hourly; it re-signs once half the certificate's life
+  # is gone and otherwise leaves every file untouched. The proxy picks the new
+  # pair up on its own hourly reload.
+  embedding-tls-renew:
+    <<: *rag-image
+    user: "0:0"
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        while velox-provider-stub-tls
+        --ca-output-directory /run/rag/embedding-ca
+        --server-output-directory /run/rag/embedding-server-tls
+        --hostname embedding --owner-uid 0 --owner-gid 0
+        --reuse-existing --ca-key-directory /run/rag/embedding-ca-key;
+        do sleep 3600; done
+    volumes:
+      - embedding_ca:/run/rag/embedding-ca
+      - embedding_ca_key:/run/rag/embedding-ca-key
+      - embedding_server_tls:/run/rag/embedding-server-tls
+    depends_on:
+      embedding-tls-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   embedding:
     image: nginx:1.27-alpine
@@ -243,6 +276,13 @@ services:
     configs:
       - source: embedding_proxy
         target: /etc/nginx/nginx.conf
+    # nginx reads its certificate only at start or reload. The hourly reload is
+    # graceful and is how a pair renewed by embedding-tls-renew takes effect.
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        (while sleep 3600; do nginx -s reload; done) &
+        exec nginx -g 'daemon off;'
     # host-gateway is how a container reaches a service on the host. Ollama runs
     # on the host because that is the only way it reaches the GPU: Docker on
     # macOS is a Linux VM with no Metal passthrough, which measured 3.1 chunks/s
@@ -438,3 +478,4 @@ volumes:
   provider_server_tls:
   embedding_ca:
   embedding_server_tls:
+  embedding_ca_key:

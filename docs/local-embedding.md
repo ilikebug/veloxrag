@@ -56,6 +56,14 @@ provider, without carving a hole in the policy. The certificate comes from
 `velox-provider-stub-tls`, which ships in the repository, and the CA goes through the existing
 `RAG_PROVIDER_CA_BUNDLE` mechanism.
 
+The server certificate lives 7 days, and api and worker load the CA once at start, so the two
+are handled differently. `embedding-tls-init` keeps the CA key in its own volume and issues a
+10-year CA. `embedding-tls-renew` re-runs the same generator hourly and re-signs the server
+certificate under that CA once half its life is gone, leaving `ca.pem` byte-identical; nginx
+reloads hourly to pick the new pair up. Neither the proxy nor the clients mount the CA key. An
+install from before the key was kept gets a fresh CA on the first `up` after upgrading, which
+needs one restart of api and worker; after that nothing needs restarting.
+
 The upstream is referenced through a variable with `resolver` set, so nginx resolves it per
 request. A literal upstream is resolved at startup and nginx refuses to boot when the name is
 missing, which would turn a stopped Ollama into a stack that will not start at all rather than

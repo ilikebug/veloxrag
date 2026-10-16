@@ -145,6 +145,30 @@ def test_minio_initialization_uses_the_safe_bounded_application_entrypoint() -> 
     assert "mc alias set" not in init_section
 
 
+def test_compose_renews_the_embedding_certificate_without_exposing_the_ca_key() -> None:
+    compose = (ROOT / "compose.yaml").read_text()
+    runtime_section = compose.split("x-rag-runtime: &rag-runtime\n", maxsplit=1)[1].split(
+        "\nservices:", maxsplit=1
+    )[0]
+    renew_section = compose.split("\n  embedding-tls-renew:\n", maxsplit=1)[1].split(
+        "\n  embedding:\n", maxsplit=1
+    )[0]
+    proxy_section = compose.split("\n  embedding:\n", maxsplit=1)[1].split(
+        "\n  provider-tls-init:", maxsplit=1
+    )[0]
+
+    assert "--reuse-existing --ca-key-directory /run/rag/embedding-ca-key" in renew_section
+    assert "sleep 3600" in renew_section
+    assert "restart: unless-stopped" in renew_section
+    # The renewed pair only takes effect once nginx reloads.
+    assert "nginx -s reload" in proxy_section
+    # Whoever holds the CA key can mint certificates every client trusts, so it
+    # stays with the two generators and out of the proxy and the clients.
+    assert compose.count("embedding_ca_key:/run/rag/embedding-ca-key") == 2
+    assert "embedding_ca_key" not in runtime_section
+    assert "embedding_ca_key" not in proxy_section
+
+
 def test_compose_persists_datastores_and_keeps_api_independent_from_worker() -> None:
     compose = (ROOT / "compose.yaml").read_text()
 
